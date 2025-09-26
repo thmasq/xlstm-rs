@@ -168,10 +168,9 @@ impl SLSTMBlock {
         // Input normalization
         let normed_input = self.ln_input.forward(input);
 
-        // Convolution (transpose for conv, then back)
-        let input_transposed = normed_input.t().to_owned();
-        let conv_output = self.conv.forward(&input_transposed);
-        let conv_activated = conv_output.t().map(|x| silu(*x));
+        // Convolution (NO transpose needed - conv expects (channels, sequence_len))
+        let conv_output = self.conv.forward(&normed_input);
+        let conv_activated = conv_output.map(|x| silu(*x));
 
         // Gate computations with recurrent connections
         let i_raw = &self.i_gate.forward(&conv_activated) + &self.ri_gate.forward(&self.ht_prev);

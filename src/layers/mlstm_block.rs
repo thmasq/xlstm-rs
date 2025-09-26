@@ -178,10 +178,9 @@ impl MLSTMBlock {
         let right_branch = self.right_proj.forward(&normed_input);
         let right_activated = right_branch.map(|x| silu(*x));
 
-        // Convolution on left branch (transpose for convolution, then back)
-        let left_transposed = left_branch.t().to_owned();
-        let conv_output = self.conv.forward(&left_transposed);
-        let conv_activated = conv_output.t().map(|x| silu(*x));
+        // Convolution on left branch (NO transpose needed - conv expects (channels, sequence_len))
+        let conv_output = self.conv.forward(&left_branch);
+        let conv_activated = conv_output.map(|x| silu(*x));
 
         // Skip connection
         let skip_connection = self.skip_proj.forward(&conv_activated);
