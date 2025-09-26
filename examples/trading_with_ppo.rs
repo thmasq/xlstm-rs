@@ -487,14 +487,6 @@ fn main() {
     println!("\n7. Agent architecture summary:");
     println!("   Actor network: {}", agent.actor.summary());
     println!("   Critic network: {}", agent.critic.summary());
-
-    println!("\nPPO Trading demonstration completed!");
-    println!("    Key achievements:");
-    println!("    - Implemented PPO optimizer for reinforcement learning");
-    println!("    - Used xLSTM networks for both actor and critic");
-    println!("    - Demonstrated trading strategy learning");
-    println!("    - Showed state representation and reward design");
-    println!("    - Compared against buy-and-hold baseline");
 }
 
 #[cfg(test)]

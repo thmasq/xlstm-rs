@@ -2,7 +2,7 @@ use ndarray::arr2;
 use xlstm_rs::models::XLSTMNetwork;
 
 fn main() {
-    println!("🧠 xLSTM Rust - Basic Usage Example");
+    println!("xLSTM Rust - Basic Usage Example");
     println!("=====================================\n");
 
     // Create different types of xLSTM networks
@@ -126,11 +126,4 @@ fn main() {
 
     println!("\n6. Network architecture information...");
     println!("{}", mixed_network.summary());
-
-    println!("\n✅ Basic usage demonstration completed!");
-    println!("    Key takeaways:");
-    println!("    - xLSTM supports flexible architectures (mLSTM, sLSTM, mixed)");
-    println!("    - Processes single inputs, batches, and sequences");
-    println!("    - Maintains internal state across time steps");
-    println!("    - Provides residual connections for better gradient flow");
 }

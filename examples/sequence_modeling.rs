@@ -373,12 +373,4 @@ fn main() {
         deep_final[[2, 0]],
         deep_final[[3, 0]]
     );
-
-    println!("\n✅ Sequence modeling demonstration completed!");
-    println!("    Key observations:");
-    println!("    - xLSTM can process complex temporal patterns");
-    println!("    - Different architectures show different response characteristics");
-    println!("    - Networks maintain long-term dependencies across sequences");
-    println!("    - Both mLSTM and sLSTM contribute to sequence understanding");
-    println!("    - Residual connections help with gradient flow in deep networks");
 }
