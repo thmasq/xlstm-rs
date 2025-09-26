@@ -520,6 +520,267 @@ impl Optimizer for Adagrad {
     }
 }
 
+/// PPO (Proximal Policy Optimization) optimizer for reinforcement learning
+///
+/// PPO is designed for actor-critic methods where you have:
+/// - An actor network (policy) that outputs action probabilities
+/// - A critic network (value function) that estimates state values
+/// - A clipped objective function to prevent large policy updates
+pub struct PPO {
+    learning_rate: f64,
+    epsilon_clip: f64,
+    value_loss_coeff: f64,
+    entropy_coeff: f64,
+    max_grad_norm: f64,
+    gamma: f64,      // Discount factor
+    gae_lambda: f64, // GAE lambda for advantage estimation
+
+    // Internal state for Adam-like optimization
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    t: i32,
+
+    // Per-parameter state
+    m: HashMap<String, Array2<f64>>, // First moment estimates
+    v: HashMap<String, Array2<f64>>, // Second moment estimates
+
+    // Experience buffer for PPO updates
+    pub states: Vec<Array2<f64>>,
+    pub actions: Vec<Array2<f64>>,
+    pub rewards: Vec<f64>,
+    pub values: Vec<f64>,
+    pub log_probs: Vec<f64>,
+    pub done_flags: Vec<bool>,
+}
+
+impl PPO {
+    pub fn new(learning_rate: f64) -> Self {
+        PPO {
+            learning_rate,
+            epsilon_clip: 0.2,
+            value_loss_coeff: 0.5,
+            entropy_coeff: 0.01,
+            max_grad_norm: 0.5,
+            gamma: 0.99,
+            gae_lambda: 0.95,
+
+            // Adam parameters
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            t: 0,
+
+            m: HashMap::new(),
+            v: HashMap::new(),
+
+            // Experience buffer
+            states: Vec::new(),
+            actions: Vec::new(),
+            rewards: Vec::new(),
+            values: Vec::new(),
+            log_probs: Vec::new(),
+            done_flags: Vec::new(),
+        }
+    }
+
+    pub fn with_params(
+        learning_rate: f64,
+        epsilon_clip: f64,
+        value_loss_coeff: f64,
+        entropy_coeff: f64,
+        max_grad_norm: f64,
+        gamma: f64,
+        gae_lambda: f64,
+    ) -> Self {
+        PPO {
+            learning_rate,
+            epsilon_clip,
+            value_loss_coeff,
+            entropy_coeff,
+            max_grad_norm,
+            gamma,
+            gae_lambda,
+
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            t: 0,
+
+            m: HashMap::new(),
+            v: HashMap::new(),
+
+            states: Vec::new(),
+            actions: Vec::new(),
+            rewards: Vec::new(),
+            values: Vec::new(),
+            log_probs: Vec::new(),
+            done_flags: Vec::new(),
+        }
+    }
+
+    /// Store experience for later PPO update
+    pub fn store_experience(
+        &mut self,
+        state: Array2<f64>,
+        action: Array2<f64>,
+        reward: f64,
+        value: f64,
+        log_prob: f64,
+        done: bool,
+    ) {
+        self.states.push(state);
+        self.actions.push(action);
+        self.rewards.push(reward);
+        self.values.push(value);
+        self.log_probs.push(log_prob);
+        self.done_flags.push(done);
+    }
+
+    /// Compute Generalized Advantage Estimation (GAE)
+    pub fn compute_advantages(&self, next_value: f64) -> (Vec<f64>, Vec<f64>) {
+        let mut advantages = vec![0.0; self.rewards.len()];
+        let mut returns = vec![0.0; self.rewards.len()];
+
+        let mut gae = 0.0;
+        let mut next_val = next_value;
+
+        // Compute advantages and returns backwards through the episode
+        for i in (0..self.rewards.len()).rev() {
+            let mask = if self.done_flags[i] { 0.0 } else { 1.0 };
+            let delta = self.rewards[i] + self.gamma * next_val * mask - self.values[i];
+            gae = delta + self.gamma * self.gae_lambda * mask * gae;
+            advantages[i] = gae;
+            returns[i] = gae + self.values[i];
+            next_val = self.values[i];
+        }
+
+        (advantages, returns)
+    }
+
+    /// Compute PPO loss components
+    pub fn compute_ppo_loss(
+        &self,
+        new_log_probs: &[f64],
+        old_log_probs: &[f64],
+        advantages: &[f64],
+        values: &[f64],
+        returns: &[f64],
+        entropy: f64,
+    ) -> (f64, f64, f64) {
+        let mut policy_loss = 0.0;
+        let mut value_loss = 0.0;
+
+        for i in 0..new_log_probs.len() {
+            // PPO clipped objective
+            let ratio = (new_log_probs[i] - old_log_probs[i]).exp();
+            let surr1 = ratio * advantages[i];
+            let surr2 =
+                ratio.clamp(1.0 - self.epsilon_clip, 1.0 + self.epsilon_clip) * advantages[i];
+            policy_loss -= surr1.min(surr2);
+
+            // Value function loss (MSE)
+            let value_error = returns[i] - values[i];
+            value_loss += 0.5 * value_error * value_error;
+        }
+
+        let n = new_log_probs.len() as f64;
+        policy_loss /= n;
+        value_loss /= n;
+
+        // Total loss
+        let total_loss =
+            policy_loss + self.value_loss_coeff * value_loss - self.entropy_coeff * entropy;
+
+        (total_loss, policy_loss, value_loss)
+    }
+
+    /// Clear the experience buffer
+    pub fn clear_buffer(&mut self) {
+        self.states.clear();
+        self.actions.clear();
+        self.rewards.clear();
+        self.values.clear();
+        self.log_probs.clear();
+        self.done_flags.clear();
+    }
+
+    /// Get the current buffer size
+    pub fn buffer_size(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Apply Adam-style parameter update with PPO-specific considerations
+    fn apply_adam_update(
+        &mut self,
+        param_id: &str,
+        param: &mut Array2<f64>,
+        gradient: &Array2<f64>,
+    ) {
+        self.t += 1;
+
+        if !self.m.contains_key(param_id) {
+            self.m
+                .insert(param_id.to_string(), Array2::zeros(param.raw_dim()));
+            self.v
+                .insert(param_id.to_string(), Array2::zeros(param.raw_dim()));
+        }
+
+        let m_t = self.m.get_mut(param_id).unwrap();
+        let v_t = self.v.get_mut(param_id).unwrap();
+
+        // Update biased first moment estimate
+        *m_t = self.beta1 * &*m_t + (1.0 - self.beta1) * gradient;
+
+        // Update biased second raw moment estimate
+        *v_t = self.beta2 * &*v_t + (1.0 - self.beta2) * (gradient * gradient);
+
+        // Compute bias-corrected first moment estimate
+        let m_hat = &*m_t / (1.0 - self.beta1.powi(self.t));
+
+        // Compute bias-corrected second raw moment estimate
+        let v_hat = &*v_t / (1.0 - self.beta2.powi(self.t));
+
+        // Apply update with gradient clipping
+        let update = self.learning_rate * &m_hat / (&v_hat.map(|x| x.sqrt()) + self.epsilon);
+
+        // Gradient clipping
+        let update_norm = update.map(|x| x * x).sum().sqrt();
+        let clipped_update = if update_norm > self.max_grad_norm {
+            update * (self.max_grad_norm / update_norm)
+        } else {
+            update
+        };
+
+        *param = &*param - &clipped_update;
+    }
+}
+
+impl Optimizer for PPO {
+    fn update(&mut self, param_id: &str, param: &mut Array2<f64>, gradient: &Array2<f64>) {
+        self.apply_adam_update(param_id, param, gradient);
+    }
+
+    fn reset(&mut self) {
+        self.t = 0;
+        self.m.clear();
+        self.v.clear();
+        self.clear_buffer();
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.learning_rate = lr;
+    }
+
+    fn get_learning_rate(&self) -> f64 {
+        self.learning_rate
+    }
+
+    fn name(&self) -> &'static str {
+        "PPO"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

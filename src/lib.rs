@@ -45,7 +45,7 @@ pub use utils::{
 
 // Re-export training system components
 pub use loss::{BCELoss, CrossEntropyLoss, HuberLoss, LossFunction, MAELoss, MSELoss};
-pub use optimizers::{Adagrad, Adam, AdamW, Optimizer, RMSprop, SGD};
+pub use optimizers::{Adagrad, Adam, AdamW, Optimizer, PPO, RMSprop, SGD};
 pub use schedulers::{
     AnnealStrategy, ConstantLR, CosineAnnealingLR, CosineAnnealingWarmRestarts, CyclicalLR,
     CyclicalMode, ExponentialLR, LearningRateScheduler, LinearLR, MultiStepLR, OneCycleLR,

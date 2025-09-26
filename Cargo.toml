@@ -30,3 +30,7 @@ path = "examples/sequence_modeling.rs"
 [[example]]
 name = "time_series_prediction"
 path = "examples/time_series_prediction.rs"
+
+[[example]]
+name = "trading_with_ppo"
+path = "examples/trading_with_ppo.rs"
