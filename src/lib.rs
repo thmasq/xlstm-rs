@@ -39,7 +39,9 @@ pub mod training;
 // Re-export commonly used core items
 pub use layers::{BlockDiagonal, CausalConv1D, LayerNorm, MLSTMBlock, SLSTMBlock};
 pub use models::XLSTMNetwork;
-pub use utils::{exp_stabilized, gelu, safe_div, safe_max, sigmoid, silu};
+pub use utils::{
+    exp_stabilized, find_suitable_num_blocks, gelu, safe_div, safe_max, sigmoid, silu,
+};
 
 // Re-export training system components
 pub use loss::{BCELoss, CrossEntropyLoss, HuberLoss, LossFunction, MAELoss, MSELoss};

@@ -6,7 +6,7 @@ use xlstm_rs::{
 
 /// Simple time series prediction example using xLSTM
 fn main() {
-    println!("📈 xLSTM Time Series Prediction Example");
+    println!("xLSTM Time Series Prediction Example");
     println!("========================================\n");
 
     // Generate sample time series data (stock price-like)
@@ -73,7 +73,7 @@ fn main() {
         }
     }
 
-    println!("\n✅ Time series prediction example completed!");
+    println!("\n Time series prediction example completed!");
 }
 
 fn generate_time_series_data() -> (

@@ -1,5 +1,5 @@
 use crate::layers::{BlockDiagonal, CausalConv1D, LayerNorm};
-use crate::utils::{gelu, safe_max, sigmoid, silu};
+use crate::utils::{find_suitable_num_blocks, gelu, safe_max, sigmoid, silu};
 use ndarray::Array2;
 
 /// Cache for sLSTM block forward pass (used in training)
@@ -98,10 +98,15 @@ impl SLSTMBlock {
     ///
     /// # Arguments
     /// * `input_size` - Size of input features
-    /// * `depth` - Depth parameter for BlockDiagonal projections
+    /// * `depth` - Desired depth parameter for BlockDiagonal projections (will be adjusted to fit)
     pub fn new(input_size: usize, depth: usize) -> Self {
         let conv_kernel_size = std::cmp::max(input_size / 8, 1);
         let ff_size = (input_size as f64 * 4.0 / 3.0) as usize; // 4/3 expansion factor
+
+        // Find suitable block counts that divide the sizes evenly
+        let gate_blocks = find_suitable_num_blocks(input_size, depth);
+        let ff_blocks = find_suitable_num_blocks(ff_size, 1); // Single block for FF layers
+        let output_blocks = find_suitable_num_blocks(input_size, 1); // Single block for output
 
         SLSTMBlock {
             input_size,
@@ -111,17 +116,17 @@ impl SLSTMBlock {
             ln_input: LayerNorm::new(input_size),
             conv: CausalConv1D::new(input_size, input_size, conv_kernel_size),
 
-            // Main gates
-            i_gate: BlockDiagonal::new(input_size, input_size, depth, true),
-            f_gate: BlockDiagonal::new(input_size, input_size, depth, true),
-            o_gate: BlockDiagonal::new(input_size, input_size, depth, true),
-            z_gate: BlockDiagonal::new(input_size, input_size, depth, true),
+            // Main gates with suitable block counts
+            i_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, true),
+            f_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, true),
+            o_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, true),
+            z_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, true),
 
             // Recurrent gates (no bias as per original implementation)
-            ri_gate: BlockDiagonal::new(input_size, input_size, depth, false),
-            rf_gate: BlockDiagonal::new(input_size, input_size, depth, false),
-            ro_gate: BlockDiagonal::new(input_size, input_size, depth, false),
-            rz_gate: BlockDiagonal::new(input_size, input_size, depth, false),
+            ri_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, false),
+            rf_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, false),
+            ro_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, false),
+            rz_gate: BlockDiagonal::new(input_size, input_size, gate_blocks, false),
 
             // Gate normalizations
             ln_i: LayerNorm::new(input_size),
@@ -136,10 +141,10 @@ impl SLSTMBlock {
             ln_h: LayerNorm::new(input_size),
 
             // Feed-forward network
-            left_linear: BlockDiagonal::new(input_size, ff_size, 1, true),
-            right_linear: BlockDiagonal::new(input_size, ff_size, 1, true),
+            left_linear: BlockDiagonal::new(input_size, ff_size, ff_blocks, true),
+            right_linear: BlockDiagonal::new(input_size, ff_size, ff_blocks, true),
             ln_output: LayerNorm::new(ff_size),
-            output_proj: BlockDiagonal::new(ff_size, input_size, 1, true),
+            output_proj: BlockDiagonal::new(ff_size, input_size, output_blocks, true),
 
             // Initialize memory states
             nt_prev: Array2::zeros((input_size, 1)),
@@ -447,5 +452,16 @@ mod tests {
         for &val in block.mt_prev.iter() {
             assert!(val.is_finite(), "Max tracker should remain finite");
         }
+    }
+
+    #[test]
+    fn test_slstm_block_small_sizes() {
+        // Test with very small input sizes that would cause division issues
+        let mut block = SLSTMBlock::new(1, 4); // input=1, depth=4 (not divisible)
+        let input = arr2(&[[1.0]]);
+
+        let output = block.forward(&input);
+        assert_eq!(output.shape(), &[1, 1]);
+        assert!(output[[0, 0]].is_finite());
     }
 }

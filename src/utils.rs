@@ -53,6 +53,35 @@ pub fn safe_div(numerator: f64, denominator: f64, epsilon: f64) -> f64 {
     numerator / (denominator + epsilon)
 }
 
+/// Find the largest divisor of `size` that is <= `max_blocks`
+/// This ensures we can create BlockDiagonal layers with valid block counts
+pub fn find_suitable_num_blocks(size: usize, desired_blocks: usize) -> usize {
+    if desired_blocks == 0 {
+        return 1;
+    }
+
+    // Start from the desired number and work down to find a divisor
+    for num_blocks in (1..=desired_blocks).rev() {
+        if size % num_blocks == 0 {
+            return num_blocks;
+        }
+    }
+
+    // Fallback to 1 if no suitable divisor found
+    1
+}
+
+/// Find divisors of a number, useful for determining valid block counts
+pub fn find_divisors(n: usize) -> Vec<usize> {
+    let mut divisors = Vec::new();
+    for i in 1..=n {
+        if n % i == 0 {
+            divisors.push(i);
+        }
+    }
+    divisors
+}
+
 /// Xavier uniform initialization for weight matrices
 pub fn xavier_uniform(rows: usize, cols: usize) -> ndarray::Array2<f64> {
     use ndarray::Array2;
@@ -123,6 +152,23 @@ mod tests {
         // Largest value should correspond to largest result
         assert!(result[2] > result[1]);
         assert!(result[1] > result[0]);
+    }
+
+    #[test]
+    fn test_find_suitable_num_blocks() {
+        assert_eq!(find_suitable_num_blocks(8, 4), 4); // 8 is divisible by 4
+        assert_eq!(find_suitable_num_blocks(6, 4), 3); // 6 is not divisible by 4, but is by 3
+        assert_eq!(find_suitable_num_blocks(5, 4), 1); // 5 is prime, only divisible by 1 and 5
+        assert_eq!(find_suitable_num_blocks(12, 5), 4); // 12 is not divisible by 5, but is by 4
+        assert_eq!(find_suitable_num_blocks(1, 4), 1); // 1 is only divisible by 1
+    }
+
+    #[test]
+    fn test_find_divisors() {
+        assert_eq!(find_divisors(1), vec![1]);
+        assert_eq!(find_divisors(6), vec![1, 2, 3, 6]);
+        assert_eq!(find_divisors(8), vec![1, 2, 4, 8]);
+        assert_eq!(find_divisors(12), vec![1, 2, 3, 4, 6, 12]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::layers::{BlockDiagonal, CausalConv1D, LayerNorm};
-use crate::utils::{safe_div, sigmoid, silu};
+use crate::utils::{find_suitable_num_blocks, safe_div, sigmoid, silu};
 use ndarray::Array2;
 
 /// Cache for mLSTM block forward pass (used in training)
@@ -103,10 +103,14 @@ impl MLSTMBlock {
     /// # Arguments
     /// * `input_size` - Size of input features
     /// * `factor` - Hidden size multiplier (hidden_size = input_size * factor)
-    /// * `depth` - Depth parameter for BlockDiagonal projections
+    /// * `depth` - Desired depth parameter for BlockDiagonal projections (will be adjusted to fit)
     pub fn new(input_size: usize, factor: f64, depth: usize) -> Self {
         let hidden_size = (input_size as f64 * factor) as usize;
         let conv_kernel_size = std::cmp::max(input_size / 10, 1);
+
+        // Find suitable block counts that divide the sizes evenly
+        let qkv_blocks = find_suitable_num_blocks(hidden_size, depth);
+        let output_blocks = find_suitable_num_blocks(input_size, 1); // For output projection
 
         MLSTMBlock {
             input_size,
@@ -115,7 +119,7 @@ impl MLSTMBlock {
             // Input normalization
             ln_input: LayerNorm::new(input_size),
 
-            // Branch projections
+            // Branch projections (single block for simplicity)
             left_proj: BlockDiagonal::new(input_size, hidden_size, 1, true),
             right_proj: BlockDiagonal::new(input_size, hidden_size, 1, true),
 
@@ -123,12 +127,12 @@ impl MLSTMBlock {
             conv: CausalConv1D::new(hidden_size, hidden_size, conv_kernel_size),
             skip_proj: BlockDiagonal::new(hidden_size, hidden_size, 1, true),
 
-            // Q, K, V projections
-            q_proj: BlockDiagonal::new(hidden_size, hidden_size, depth, true),
-            k_proj: BlockDiagonal::new(hidden_size, hidden_size, depth, true),
-            v_proj: BlockDiagonal::new(hidden_size, hidden_size, depth, true),
+            // Q, K, V projections with suitable block counts
+            q_proj: BlockDiagonal::new(hidden_size, hidden_size, qkv_blocks, true),
+            k_proj: BlockDiagonal::new(hidden_size, hidden_size, qkv_blocks, true),
+            v_proj: BlockDiagonal::new(hidden_size, hidden_size, qkv_blocks, true),
 
-            // Gates
+            // Gates (single block for simplicity)
             i_gate: BlockDiagonal::new(hidden_size, hidden_size, 1, true),
             f_gate: BlockDiagonal::new(hidden_size, hidden_size, 1, true),
             o_gate: BlockDiagonal::new(hidden_size, hidden_size, 1, true),
@@ -145,7 +149,7 @@ impl MLSTMBlock {
             // Output processing
             group_norm: LayerNorm::new(hidden_size),
             ln_output: LayerNorm::new(hidden_size),
-            output_proj: BlockDiagonal::new(hidden_size, input_size, 1, true),
+            output_proj: BlockDiagonal::new(hidden_size, input_size, output_blocks, true),
             ln_proj: LayerNorm::new(input_size),
 
             // Initialize memory states
@@ -385,5 +389,16 @@ mod tests {
                 assert!(output[[row, col]].is_finite());
             }
         }
+    }
+
+    #[test]
+    fn test_mlstm_block_small_sizes() {
+        // Test with very small input sizes that would cause division issues
+        let mut block = MLSTMBlock::new(1, 2.0, 4); // input=1, depth=4 (not divisible)
+        let input = arr2(&[[1.0]]);
+
+        let output = block.forward(&input);
+        assert_eq!(output.shape(), &[1, 1]);
+        assert!(output[[0, 0]].is_finite());
     }
 }
