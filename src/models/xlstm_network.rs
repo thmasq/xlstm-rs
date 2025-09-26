@@ -23,6 +23,7 @@ pub enum XLSTMBlockType {
 }
 
 /// Individual block in the xLSTM network
+#[derive(Clone)]
 pub enum XLSTMBlock {
     MLSTM(MLSTMBlock),
     SLSTM(SLSTMBlock),
@@ -108,6 +109,7 @@ impl XLSTMBlock {
 /// let output = network.forward(&input);
 /// assert_eq!(output.shape(), &[16, 1]);
 /// ```
+#[derive(Clone)]
 pub struct XLSTMNetwork {
     /// Sequence of xLSTM blocks
     pub blocks: Vec<XLSTMBlock>,

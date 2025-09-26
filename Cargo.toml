@@ -26,3 +26,7 @@ path = "examples/basic_usage.rs"
 [[example]]
 name = "sequence_modeling"
 path = "examples/sequence_modeling.rs"
+
+[[example]]
+name = "time_series_prediction"
+path = "examples/time_series_prediction.rs"
