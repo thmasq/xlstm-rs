@@ -1,7 +1,30 @@
+use csv::ReaderBuilder;
 use ndarray::{Array2, arr2};
 use rand::Rng;
 use rand_distr::num_traits::Float;
+use std::error::Error;
+use std::fs::File;
 use xlstm_rs::{models::XLSTMNetwork, optimizers::PPO, utils::safe_div};
+
+/// Load stock price data from a CSV file
+fn load_stock_data(file_path: &str) -> Result<Vec<f64>, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().from_reader(file);
+    let mut prices = Vec::new();
+
+    // Assuming the header is present, we can iterate over records.
+    // If not, we can skip the header reading part. The provided file has a header.
+    for result in rdr.records() {
+        let record = result?;
+        // The 'last_price' is the 13th column, which corresponds to index 12.
+        if let Some(price_str) = record.get(12) {
+            if let Ok(price) = price_str.parse::<f64>() {
+                prices.push(price);
+            }
+        }
+    }
+    Ok(prices)
+}
 
 /// Simple trading environment for PPO training
 struct TradingEnvironment {
@@ -295,18 +318,35 @@ fn generate_stock_data(length: usize, initial_price: f64, volatility: f64) -> Ve
 
 fn main() {
     println!("xLSTM PPO Trading Agent");
-    println!("==========================\n");
+    println!("==========================\\n");
 
-    // Generate synthetic market data
-    println!("1. Generating synthetic market data...");
-    let train_prices = generate_stock_data(2000, 100.0, 0.2);
-    let test_prices = generate_stock_data(500, train_prices.last().unwrap().clone(), 0.2);
+    // Load market data from CSV
+    println!("1. Loading market data from petr4.csv...");
+    let all_prices = match load_stock_data("petr4.csv") {
+        Ok(prices) => prices,
+        Err(e) => {
+            eprintln!(
+                "Error loading data from petr4.csv: {}. \\nFalling back to synthetic data.",
+                e
+            );
+            generate_stock_data(2500, 100.0, 0.2)
+        }
+    };
+
+    if all_prices.len() < 100 {
+        panic!("Not enough data to run the simulation. Need at least 100 data points.");
+    }
+
+    // Split data into training and testing sets (80% train, 20% test)
+    let split_index = (all_prices.len() as f64 * 0.8) as usize;
+    let train_prices = all_prices[..split_index].to_vec();
+    let test_prices = all_prices[split_index..].to_vec();
 
     println!("   Training data: {} price points", train_prices.len());
     println!("   Testing data: {} price points", test_prices.len());
 
     // Setup environment and agent
-    println!("\n2. Setting up trading environment and agent...");
+    println!("\\n2. Setting up trading environment and agent...");
     let window_size = 20;
     let initial_balance = 10000.0;
     let state_size = window_size + 5; // Price windows + portfolio features
@@ -323,7 +363,7 @@ fn main() {
     println!("   Critic parameters: {}", agent.critic.num_parameters());
 
     // Training loop
-    println!("\n3. Training the PPO agent...");
+    println!("\\n3. Training the PPO agent...");
     let num_episodes = 100;
     let update_interval = 10; // Update every N episodes
 
@@ -399,7 +439,7 @@ fn main() {
         }
     }
 
-    println!("\n4. Training completed!");
+    println!("\\n4. Training completed!");
     println!("   Best episode reward: {:.4}", best_reward);
     println!(
         "   Final average reward (last 20): {:.4}",
@@ -411,7 +451,7 @@ fn main() {
     );
 
     // Testing phase
-    println!("\n5. Testing the trained agent...");
+    println!("\\n5. Testing the trained agent...");
     let mut test_env = TradingEnvironment::new(test_prices.clone(), initial_balance, window_size);
     agent.reset_states();
 
@@ -468,7 +508,7 @@ fn main() {
     let final_price = test_prices.last().unwrap();
     let buy_hold_return = (final_price - initial_price) / initial_price;
 
-    println!("\n6. Performance comparison:");
+    println!("\\n6. Performance comparison:");
     println!("   PPO Agent return: {:.2}%", total_return * 100.0);
     println!("   Buy & Hold return: {:.2}%", buy_hold_return * 100.0);
 
@@ -484,7 +524,7 @@ fn main() {
         );
     }
 
-    println!("\n7. Agent architecture summary:");
+    println!("\\n7. Agent architecture summary:");
     println!("   Actor network: {}", agent.actor.summary());
     println!("   Critic network: {}", agent.critic.summary());
 }
