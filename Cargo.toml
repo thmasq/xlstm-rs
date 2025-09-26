@@ -1,12 +1,7 @@
 [package]
-name = "xlstm-rs"
+name = "xlstm-ppo"
 version = "0.1.0"
-authors = ["Thomas Q <thomasqsa@gmail.com>"]
 edition = "2024"
-description = "A Rust implementation of xLSTM (Extended Long Short-Term Memory) neural networks"
-license = "MIT"
-keywords = ["xlstm", "lstm", "neural-network", "machine-learning", "deep-learning"]
-categories = ["algorithms", "science"]
 
 [dependencies]
 bincode = "2.0.1"
