@@ -1,11 +1,9 @@
+use crate::ppo_algorithm::{PPOAgent, PPOConfig};
 use crate::trading_environment::{
     ActionType, TradingConfig, TradingEnvironment, create_sample_market_data,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use xlstm_ppo::PPOAgent;
-use xlstm_ppo::PPOConfig;
-use xlstm_ppo::trading_environment;
 
 /// Training configuration
 #[derive(Clone, Debug)]
@@ -190,12 +188,15 @@ impl Trainer {
         }
     }
 
-    /// Run a single episode — now an associated function taking the agent and environment separately.
-    /// This avoids borrowing `&mut self` and allows mutable borrows of distinct fields simultaneously.
+    /// Run a single episode.
+    ///
+    /// This is implemented as an associated function that operates on separate mutable references
+    /// to the agent and environment to avoid borrowing the entire Trainer (`&mut self`) at once,
+    /// which prevents simultaneous mutable borrows of separate fields.
     fn run_episode(
         agent: &mut PPOAgent,
         env: &mut TradingEnvironment,
-        max_episode_steps: usize,
+        config: &TrainingConfig,
         is_training: bool,
     ) -> (f64, HashMap<String, f64>) {
         let mut total_reward = 0.0;
@@ -207,7 +208,7 @@ impl Trainer {
 
         let mut episode_ended = false;
 
-        while !episode_ended && step_count < max_episode_steps {
+        while !episode_ended && step_count < config.max_episode_steps {
             // Select action
             let (action, log_prob, value) = agent.select_action(&obs);
 
@@ -237,12 +238,8 @@ impl Trainer {
             let mut eval_stats = Vec::new();
 
             for _ in 0..self.config.eval_episodes {
-                let (_, episode_stats) = Trainer::run_episode(
-                    &mut self.agent,
-                    eval_env,
-                    self.config.max_episode_steps,
-                    false,
-                );
+                let (_, episode_stats) =
+                    Trainer::run_episode(&mut self.agent, eval_env, &self.config, false);
                 eval_stats.push(episode_stats);
             }
 
@@ -334,12 +331,8 @@ impl Trainer {
             let episode_start = Instant::now();
 
             // Run training episode
-            let (episode_reward, episode_stats) = Trainer::run_episode(
-                &mut self.agent,
-                &mut self.train_env,
-                self.config.max_episode_steps,
-                true,
-            );
+            let (episode_reward, episode_stats) =
+                Trainer::run_episode(&mut self.agent, &mut self.train_env, &self.config, true);
             rollout_steps += self.agent.trajectory.len();
 
             // Extract episode statistics
@@ -557,11 +550,11 @@ mod tests {
         let mut trainer = create_sample_training_setup();
         trainer.config.max_episode_steps = 10; // Short episode for testing
 
-        // Updated call to the associated function signature:
+        // Call the associated function with explicit mutable field references
         let (reward, stats) = Trainer::run_episode(
             &mut trainer.agent,
             &mut trainer.train_env,
-            trainer.config.max_episode_steps,
+            &trainer.config,
             true,
         );
 
