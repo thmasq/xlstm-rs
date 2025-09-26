@@ -1,5 +1,5 @@
 use ndarray::arr2;
-use xlstm_rust::models::XLSTMNetwork;
+use xlstm_rs::models::XLSTMNetwork;
 
 fn main() {
     println!("🧠 xLSTM Rust - Basic Usage Example");
