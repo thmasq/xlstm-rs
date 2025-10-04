@@ -120,9 +120,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let (predictions, _) = model.predict_last(input_batch, None);
 
             // Fused MSE loss computation (single kernel chain)
-            let loss = (predictions.clone() - target_batch.clone())
-                .powf_scalar(2.0)
-                .mean();
+            let loss = ((predictions - target_batch).powf_scalar(2.0)).mean();
 
             // Extract loss value before backward
             let loss_value: <MyBackend as Backend>::FloatElem = loss.clone().into_scalar();

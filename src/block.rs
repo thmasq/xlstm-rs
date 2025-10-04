@@ -51,10 +51,11 @@ impl XLstmblockConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> XLstmblock<B> {
         match self.block_type {
             BlockType::SLSTM => {
-                let lstm = SLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
-                    .with_dropout(self.dropout)
-                    .with_initializer(self.initializer.clone())
-                    .init(device);
+                let lstm: SLstm<B> =
+                    SLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
+                        .with_dropout(self.dropout)
+                        .with_initializer(self.initializer.clone())
+                        .init(device);
 
                 XLstmblock {
                     lstm: LSTMVariant::SLSTM(lstm),
@@ -64,10 +65,11 @@ impl XLstmblockConfig {
                 }
             }
             BlockType::MLSTM => {
-                let lstm = MLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
-                    .with_dropout(self.dropout)
-                    .with_initializer(self.initializer.clone())
-                    .init(device);
+                let lstm: MLstm<B> =
+                    MLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
+                        .with_dropout(self.dropout)
+                        .with_initializer(self.initializer.clone())
+                        .init(device);
 
                 XLstmblock {
                     lstm: LSTMVariant::MLSTM(lstm),
@@ -130,36 +132,37 @@ impl<B: Backend> XLstmblock<B> {
         <B as Backend>::FloatElem: num_traits::ToPrimitive,
         B: Backend<FloatElem: num_traits::FromPrimitive>,
     {
-        let (lstm_output, new_state) = match (&self.lstm, state) {
-            (LSTMVariant::SLSTM(lstm), Some(LSTMState::SLSTM(s))) => {
-                let (out, state) = lstm.forward(input_seq.clone(), Some(s));
-                (out, Some(LSTMState::SLSTM(state)))
-            }
-            (LSTMVariant::SLSTM(lstm), _) => {
-                let (out, state) = lstm.forward(input_seq.clone(), None);
-                (out, Some(LSTMState::SLSTM(state)))
-            }
-            (LSTMVariant::MLSTM(lstm), Some(LSTMState::MLSTM(s))) => {
-                let (out, state) = lstm.forward(input_seq.clone(), Some(s));
-                (out, Some(LSTMState::MLSTM(state)))
-            }
-            (LSTMVariant::MLSTM(lstm), _) => {
-                let (out, state) = lstm.forward(input_seq.clone(), None);
-                (out, Some(LSTMState::MLSTM(state)))
-            }
-        };
+        let residual = input_seq.clone();
+
+        let (lstm_output, new_state): (Tensor<B, 3>, Option<LSTMState<B>>) =
+            match (&self.lstm, state) {
+                (LSTMVariant::SLSTM(lstm), Some(LSTMState::SLSTM(s))) => {
+                    let (out, state): (Tensor<B, 3>, Vec<SLstmstate<B, 2>>) =
+                        lstm.forward(input_seq, Some(s)); // No clone here
+                    (out, Some(LSTMState::SLSTM(state)))
+                }
+                (LSTMVariant::SLSTM(lstm), _) => {
+                    let (out, state) = lstm.forward(input_seq, None);
+                    (out, Some(LSTMState::SLSTM(state)))
+                }
+                (LSTMVariant::MLSTM(lstm), Some(LSTMState::MLSTM(s))) => {
+                    let (out, state) = lstm.forward(input_seq, Some(s));
+                    (out, Some(LSTMState::MLSTM(state)))
+                }
+                (LSTMVariant::MLSTM(lstm), _) => {
+                    let (out, state) = lstm.forward(input_seq, None);
+                    (out, Some(LSTMState::MLSTM(state)))
+                }
+            };
 
         // Apply activation
-        let output = activation::gelu(lstm_output);
-
+        let output: Tensor<B, 3> = activation::gelu(lstm_output);
         // Apply normalization
-        let output = self.norm.forward(output);
-
+        let output: Tensor<B, 3> = self.norm.forward(output);
         // Apply projection
-        let output = self.proj.forward(output);
-
+        let output: Tensor<B, 3> = self.proj.forward(output);
         // Apply dropout and residual connection
-        let output = self.dropout.forward(output) + input_seq;
+        let output: Tensor<B, 3> = self.dropout.forward(output) + residual;
 
         (output, new_state)
     }
