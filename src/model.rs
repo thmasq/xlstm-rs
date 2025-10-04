@@ -200,9 +200,10 @@ impl<B: Backend> XLstm<B> {
 
         // Pass through blocks
         for (i, block) in self.blocks.iter().enumerate() {
-            let (output, state) = block.forward(x, hidden_states[i].clone());
+            let old_state = hidden_states[i].take();
+            let (output, new_state) = block.forward(x, old_state);
             x = output;
-            hidden_states[i] = state;
+            hidden_states[i] = new_state;
         }
 
         // Apply output head
