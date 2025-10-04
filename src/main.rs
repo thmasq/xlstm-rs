@@ -1,3 +1,4 @@
+#![feature(slice_pattern)]
 #![recursion_limit = "256"]
 
 /*!
@@ -16,6 +17,7 @@ use burn::{
 };
 use burn_autodiff::Autodiff;
 use burn_wgpu::{Wgpu, WgpuDevice};
+use core::slice::SlicePattern;
 use csv::ReaderBuilder;
 use plotters::prelude::*;
 use serde::Deserialize;
@@ -27,11 +29,11 @@ type MyBackend = Autodiff<Wgpu>;
 type DataLoadResult = Result<(Vec<Vec<f32>>, Vec<f32>), Box<dyn Error>>;
 
 type SequenceData<B> = (
-    Vec<Tensor<B, 2>>, // train_x
-    Vec<Tensor<B, 2>>, // train_y
-    Vec<Tensor<B, 2>>, // test_x
-    Vec<Tensor<B, 2>>, // test_y
-    Vec<(f32, f32)>,   // test_prices: (current_price, next_price)
+    Tensor<B, 3>,    // train_x: [num_samples, seq_length, input_size]
+    Tensor<B, 2>,    // train_y: [num_samples, output_size]
+    Tensor<B, 3>,    // test_x: [num_samples, seq_length, input_size]
+    Tensor<B, 2>,    // test_y: [num_samples, output_size]
+    Vec<(f32, f32)>, // test_prices: (current_price, next_price)
 );
 
 #[derive(Deserialize)]
@@ -71,13 +73,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Device
     let device = WgpuDevice::default();
 
-    // Create sequences
+    // Create sequences (now returns stacked tensors)
     println!("Creating sequences (seq_length={seq_length})...");
     let (train_x, train_y, test_x, test_y, test_prices) =
         create_sequences(&embeddings, &prices, seq_length, train_split, &device);
 
-    println!("Training samples: {}", train_x.len());
-    println!("Testing samples: {}\n", test_x.len());
+    let num_train = train_x.dims()[0];
+    let num_test = test_x.dims()[0];
+
+    println!("Training samples: {}", num_train);
+    println!("Testing samples: {}\n", num_test);
 
     // Create model with alternating blocks
     println!("Creating xLSTM model with alternating sLSTM/mLSTM blocks...");
@@ -99,8 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting training...\n");
 
-    // Training loop
-    let num_train_batches = train_x.len().div_ceil(batch_size);
+    // Training loop with vectorized batching
+    let num_train_batches = num_train.div_ceil(batch_size);
 
     for epoch in 0..num_epochs {
         let mut total_loss = 0.0f32;
@@ -108,21 +113,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         for batch_idx in 0..num_train_batches {
             let start_idx = batch_idx * batch_size;
-            let end_idx = (start_idx + batch_size).min(train_x.len());
+            let end_idx = (start_idx + batch_size).min(num_train);
 
             if start_idx >= end_idx {
                 break;
             }
 
-            // Create batch tensors
-            let batch_x: Vec<_> = train_x[start_idx..end_idx]
-                .iter()
-                .map(|t| t.clone().unsqueeze_dim(0))
-                .collect();
-            let batch_y: Vec<_> = train_y[start_idx..end_idx].to_vec();
-
-            let input_batch = Tensor::cat(batch_x, 0);
-            let target_batch = Tensor::cat(batch_y, 0);
+            // Vectorized batch extraction using slicing (no clones!)
+            let input_batch =
+                train_x
+                    .clone()
+                    .slice([start_idx..end_idx, 0..seq_length, 0..input_size]);
+            let target_batch = train_y.clone().slice([start_idx..end_idx, 0..output_size]);
 
             // Forward pass
             let (predictions, _) = model.predict_last(input_batch, None);
@@ -146,8 +148,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let avg_loss = total_loss / num_batches as f32;
 
         // Validation
-        if epoch % 5 == 0 && !test_x.is_empty() {
-            let val_loss = evaluate(&model, &test_x, &test_y);
+        if epoch % 5 == 0 && num_test > 0 {
+            let val_loss = evaluate(
+                &model,
+                &test_x,
+                &test_y,
+                seq_length,
+                input_size,
+                output_size,
+            );
             println!(
                 "Epoch [{:2}/{}], Train Loss: {:.6}, Val Loss: {:.6}",
                 epoch + 1,
@@ -174,7 +183,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Make predictions on test set
     println!("\n\nGenerating predictions on test set...");
-    let (predictions, actuals) = make_predictions(&model, &test_x, &test_prices);
+    let (predictions, actuals) =
+        make_predictions(&model, &test_x, &test_prices, seq_length, input_size);
 
     // Calculate metrics
     let mse = predictions
@@ -241,38 +251,52 @@ fn create_sequences<B: Backend>(
     train_split: f32,
     device: &B::Device,
 ) -> SequenceData<B> {
-    let mut x_data = Vec::new();
-    let mut y_data = Vec::new();
-    let mut price_pairs = Vec::new();
+    let num_sequences = embeddings.len() - seq_length;
+    let input_size = 128;
+
+    // Pre-allocate flat arrays for all sequences
+    let mut x_data = Vec::with_capacity(num_sequences * seq_length * input_size);
+    let mut y_data = Vec::with_capacity(num_sequences);
+    let mut price_pairs = Vec::with_capacity(num_sequences);
 
     // Create sliding windows
-    for i in 0..(embeddings.len() - seq_length) {
-        // Input: sequence of embeddings
-        let seq: Vec<Vec<f32>> = embeddings[i..i + seq_length].to_vec();
-        let seq_flat: Vec<f32> = seq.into_iter().flatten().collect();
+    for i in 0..num_sequences {
+        // Input: sequence of embeddings (flattened)
+        for j in 0..seq_length {
+            x_data.extend_from_slice(&embeddings[i + j]);
+        }
 
         // Target: next price (normalized as relative change)
         let current_price = prices[i + seq_length - 1];
         let next_price = prices[i + seq_length];
         let target = (next_price - current_price) / current_price; // Relative change
 
-        // Convert to tensors
-        let x_tensor =
-            Tensor::<B, 1>::from_floats(seq_flat.as_slice(), device).reshape([seq_length, 128]);
-        let y_tensor = Tensor::<B, 1>::from_floats([target].as_slice(), device).reshape([1, 1]);
-
-        x_data.push(x_tensor);
-        y_data.push(y_tensor);
+        y_data.push(target);
         price_pairs.push((current_price, next_price));
     }
 
     // Split into train/test
-    let split_idx = (x_data.len() as f32 * train_split) as usize;
+    let split_idx = (num_sequences as f32 * train_split) as usize;
 
-    let train_x = x_data[..split_idx].to_vec();
-    let train_y = y_data[..split_idx].to_vec();
-    let test_x = x_data[split_idx..].to_vec();
-    let test_y = y_data[split_idx..].to_vec();
+    // Create stacked tensors for train set
+    let train_x = Tensor::<B, 1>::from_floats(
+        x_data[..(split_idx * seq_length * input_size)].as_slice(),
+        device,
+    )
+    .reshape([split_idx, seq_length, input_size]);
+    let train_y =
+        Tensor::<B, 1>::from_floats(y_data[..split_idx].as_slice(), device).reshape([split_idx, 1]);
+
+    // Create stacked tensors for test set
+    let test_len = num_sequences - split_idx;
+    let test_x = Tensor::<B, 1>::from_floats(
+        x_data[(split_idx * seq_length * input_size)..].as_slice(),
+        device,
+    )
+    .reshape([test_len, seq_length, input_size]);
+    let test_y =
+        Tensor::<B, 1>::from_floats(y_data[split_idx..].as_slice(), device).reshape([test_len, 1]);
+
     let test_prices = price_pairs[split_idx..].to_vec();
 
     (train_x, train_y, test_x, test_y, test_prices)
@@ -280,30 +304,32 @@ fn create_sequences<B: Backend>(
 
 fn evaluate<B: Backend>(
     model: &xlstm::XLstm<B>,
-    test_x: &[Tensor<B, 2>],
-    test_y: &[Tensor<B, 2>],
+    test_x: &Tensor<B, 3>,
+    test_y: &Tensor<B, 2>,
+    seq_length: usize,
+    input_size: usize,
+    output_size: usize,
 ) -> f32
 where
     <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive,
 {
-    if test_x.is_empty() {
+    let num_test = test_x.dims()[0];
+    if num_test == 0 {
         return 0.0;
     }
 
-    let batch_size = 32.min(test_x.len());
+    let batch_size = 32.min(num_test);
     let mut total_loss = 0.0f32;
     let mut num_batches = 0;
 
-    for i in (0..test_x.len()).step_by(batch_size) {
-        let end_idx = (i + batch_size).min(test_x.len());
-        let batch_x: Vec<_> = test_x[i..end_idx]
-            .iter()
-            .map(|t| t.clone().unsqueeze_dim(0))
-            .collect();
-        let batch_y: Vec<_> = test_y[i..end_idx].to_vec();
+    for i in (0..num_test).step_by(batch_size) {
+        let end_idx = (i + batch_size).min(num_test);
 
-        let input_batch = Tensor::cat(batch_x, 0);
-        let target_batch = Tensor::cat(batch_y, 0);
+        // Vectorized batch extraction using slicing
+        let input_batch = test_x
+            .clone()
+            .slice([i..end_idx, 0..seq_length, 0..input_size]);
+        let target_batch = test_y.clone().slice([i..end_idx, 0..output_size]);
 
         let (predictions, _) = model.predict_last(input_batch, None);
         let loss = mse_loss(predictions, target_batch);
@@ -318,29 +344,43 @@ where
 
 fn make_predictions<B: Backend>(
     model: &xlstm::XLstm<B>,
-    test_x: &[Tensor<B, 2>],
+    test_x: &Tensor<B, 3>,
     test_prices: &[(f32, f32)],
+    seq_length: usize,
+    input_size: usize,
 ) -> (Vec<f32>, Vec<f32>)
 where
     <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive,
 {
-    let mut predictions = Vec::new();
-    let mut actuals = Vec::new();
+    let num_test = test_x.dims()[0];
+    let mut predictions = Vec::with_capacity(num_test);
+    let mut actuals = Vec::with_capacity(num_test);
 
-    for (idx, x) in test_x.iter().enumerate() {
-        let input = x.clone().unsqueeze_dim(0);
-        let (pred, _) = model.predict_last(input, None);
+    // Process in batches for efficiency
+    let batch_size = 32;
+    for i in (0..num_test).step_by(batch_size) {
+        let end_idx = (i + batch_size).min(num_test);
 
-        // Get predicted relative change
-        let pred_value: <B as Backend>::FloatElem = pred.into_scalar();
-        let pred_relative = num_traits::ToPrimitive::to_f32(&pred_value).unwrap_or(0.0);
+        // Vectorized batch extraction
+        let input_batch = test_x
+            .clone()
+            .slice([i..end_idx, 0..seq_length, 0..input_size]);
+        let (pred_batch, _) = model.predict_last(input_batch, None);
 
-        // Convert back to actual price
-        let (current_price, actual_next_price) = test_prices[idx];
-        let predicted_price = current_price * (1.0 + pred_relative);
+        // Extract predictions from batch
+        let batch_len = end_idx - i;
+        for j in 0..batch_len {
+            let pred_value: <B as Backend>::FloatElem =
+                pred_batch.clone().slice([j..(j + 1), 0..1]).into_scalar();
+            let pred_relative = num_traits::ToPrimitive::to_f32(&pred_value).unwrap_or(0.0);
 
-        predictions.push(predicted_price);
-        actuals.push(actual_next_price);
+            // Convert back to actual price
+            let (current_price, actual_next_price) = test_prices[i + j];
+            let predicted_price = current_price * (1.0 + pred_relative);
+
+            predictions.push(predicted_price);
+            actuals.push(actual_next_price);
+        }
     }
 
     (predictions, actuals)
