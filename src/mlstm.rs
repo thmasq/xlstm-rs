@@ -99,7 +99,7 @@ impl<B: Backend> MLstm<B> {
     /// * Final state
     pub fn forward(
         &self,
-        input_seq: Tensor<B, 3>,
+        input_seq: &Tensor<B, 3>,
         state: Option<alloc::vec::Vec<MLstmstate<B>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<MLstmstate<B>>)
     where

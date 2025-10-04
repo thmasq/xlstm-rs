@@ -97,7 +97,7 @@ impl<B: Backend> SLstm<B> {
     /// * Final state
     pub fn forward(
         &self,
-        input_seq: Tensor<B, 3>,
+        input_seq: &Tensor<B, 3>,
         state: Option<alloc::vec::Vec<SLstmstate<B, 2>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<SLstmstate<B, 2>>) {
         let device = input_seq.device();
