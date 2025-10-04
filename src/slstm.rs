@@ -25,7 +25,7 @@ pub struct SLstmstate<B: Backend, const D: usize> {
 
 impl<B: Backend, const D: usize> SLstmstate<B, D> {
     /// Create a new sLSTM state
-    pub fn new(cell: Tensor<B, D>, hidden: Tensor<B, D>) -> Self {
+    pub const fn new(cell: Tensor<B, D>, hidden: Tensor<B, D>) -> Self {
         Self { cell, hidden }
     }
 }
@@ -89,11 +89,11 @@ impl<B: Backend> SLstm<B> {
     /// Forward pass through sLSTM
     ///
     /// # Arguments
-    /// * `input_seq` - Input tensor of shape [batch_size, seq_length, input_size]
+    /// * `input_seq` - Input tensor of shape [`batch_size`, `seq_length`, `input_size`]
     /// * `state` - Optional initial state
     ///
     /// # Returns
-    /// * Output tensor of shape [batch_size, seq_length, hidden_size]
+    /// * Output tensor of shape [`batch_size`, `seq_length`, `hidden_size`]
     /// * Final state
     pub fn forward(
         &self,
@@ -197,11 +197,11 @@ impl<B: Backend> SLstmcell<B> {
 
         // Initialize biases with specific values for stability
         let mut bias_data = alloc::vec![0.0; 4 * hidden_size];
-        for i in 0..hidden_size {
-            bias_data[i] = -2.0;
+        for item in bias_data.iter_mut().take(hidden_size) {
+            *item = -2.0;
         }
-        for i in hidden_size..(2 * hidden_size) {
-            bias_data[i] = -2.0;
+        for item in bias_data.iter_mut().take(2 * hidden_size).skip(hidden_size) {
+            *item = -2.0;
         }
         let bias = Tensor::from_floats(bias_data.as_slice(), device);
 
@@ -217,9 +217,9 @@ impl<B: Backend> SLstmcell<B> {
     /// Forward pass through sLSTM cell with exponential gating
     ///
     /// # Arguments
-    /// * `input` - Input tensor [batch_size, input_size]
-    /// * `hidden` - Hidden state [batch_size, hidden_size]
-    /// * `cell` - Cell state [batch_size, hidden_size]
+    /// * `input` - Input tensor [`batch_size`, `input_size`]
+    /// * `hidden` - Hidden state [`batch_size`, `hidden_size`]
+    /// * `cell` - Cell state [`batch_size`, `hidden_size`]
     ///
     /// # Returns
     /// * New hidden state
@@ -233,7 +233,7 @@ impl<B: Backend> SLstmcell<B> {
         // Compute all gates: i, f, g, o
         let gates = input.matmul(self.weight_ih.val().transpose())
             + hidden.matmul(self.weight_hh.val().transpose())
-            + self.bias.val().clone().unsqueeze_dim(0);
+            + self.bias.val().unsqueeze_dim(0);
 
         let chunks = gates.chunk(4, 1);
         let i_gate = &chunks[0];
@@ -272,7 +272,7 @@ mod tests {
 
         let input = Tensor::<TestBackend, 3>::random([4, 10, 64], Distribution::Default, &device);
 
-        let (output, states) = slstm.forward(input, None);
+        let (output, states) = slstm.forward(&input, None);
 
         assert_eq!(output.dims(), [4, 10, 128]);
         assert_eq!(states.len(), 2);

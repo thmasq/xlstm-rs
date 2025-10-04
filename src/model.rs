@@ -14,6 +14,7 @@ use burn::{
     nn::{Dropout, DropoutConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig},
     tensor::{Tensor, activation, backend::Backend},
 };
+use num_traits::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{BlockType, XLstmblock, XLstmblockConfig, block::LSTMState};
@@ -128,13 +129,13 @@ impl XLstmconfig {
                 })
                 .collect(),
             LstmType::Custom(types) => {
-                if types.len() != self.num_blocks {
-                    panic!(
-                        "Custom LSTM type length ({}) must match num_blocks ({})",
-                        types.len(),
-                        self.num_blocks
-                    );
-                }
+                assert!(
+                    (types.len() == self.num_blocks),
+                    "Custom LSTM type length ({}) must match num_blocks ({})",
+                    types.len(),
+                    self.num_blocks
+                );
+
                 types.clone()
             }
         }
@@ -170,11 +171,11 @@ impl<B: Backend> XLstm<B> {
     /// Forward pass through xLSTM model
     ///
     /// # Arguments
-    /// * `input_seq` - Input tensor [batch_size, seq_length, input_size]
+    /// * `input_seq` - Input tensor [`batch_size`, `seq_length`, `input_size`]
     /// * `states` - Optional initial states for each block
     ///
     /// # Returns
-    /// * Output tensor [batch_size, seq_length, output_size]
+    /// * Output tensor [`batch_size`, `seq_length`, `output_size`]
     /// * Final states for each block
     pub fn forward(
         &self,
@@ -182,8 +183,7 @@ impl<B: Backend> XLstm<B> {
         states: Option<alloc::vec::Vec<Option<LSTMState<B>>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<Option<LSTMState<B>>>)
     where
-        <B as Backend>::FloatElem: num_traits::ToPrimitive,
-        <B as Backend>::FloatElem: num_traits::FromPrimitive,
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive,
     {
         // Apply input projection if present
         let mut x = if let Some((linear, norm, dropout)) = &self.input_projection {
@@ -218,11 +218,11 @@ impl<B: Backend> XLstm<B> {
     /// Forward pass returning only the last timestep prediction
     ///
     /// # Arguments
-    /// * `input_seq` - Input tensor [batch_size, seq_length, input_size]
+    /// * `input_seq` - Input tensor [`batch_size`, `seq_length`, `input_size`]
     /// * `states` - Optional initial states
     ///
     /// # Returns
-    /// * Last timestep output [batch_size, output_size]
+    /// * Last timestep output [`batch_size`, `output_size`]
     /// * Final states
     pub fn predict_last(
         &self,
@@ -230,8 +230,7 @@ impl<B: Backend> XLstm<B> {
         states: Option<alloc::vec::Vec<Option<LSTMState<B>>>>,
     ) -> (Tensor<B, 2>, alloc::vec::Vec<Option<LSTMState<B>>>)
     where
-        <B as Backend>::FloatElem: num_traits::ToPrimitive,
-        <B as Backend>::FloatElem: num_traits::FromPrimitive,
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive,
     {
         let (output, states) = self.forward(input_seq, states);
         let [batch_size, seq_length, _] = output.dims();
@@ -247,7 +246,10 @@ impl<B: Backend> XLstm<B> {
 
     /// Get block configuration
     pub fn get_block_config(&self) -> alloc::vec::Vec<BlockType> {
-        self.blocks.iter().map(|block| block.get_type()).collect()
+        self.blocks
+            .iter()
+            .map(super::block::XLstmblock::get_type)
+            .collect()
     }
 
     /// Print model architecture summary

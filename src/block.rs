@@ -117,11 +117,11 @@ impl<B: Backend> XLstmblock<B> {
     /// Forward pass through xLSTM block
     ///
     /// # Arguments
-    /// * `input_seq` - Input tensor [batch_size, seq_length, input_size]
+    /// * `input_seq` - Input tensor [`batch_size`, `seq_length`, `input_size`]
     /// * `state` - Optional initial state
     ///
     /// # Returns
-    /// * Output tensor [batch_size, seq_length, input_size]
+    /// * Output tensor [`batch_size`, `seq_length`, `input_size`]
     /// * Final state
     pub fn forward(
         &self,
@@ -166,7 +166,7 @@ impl<B: Backend> XLstmblock<B> {
     }
 
     /// Get the block type
-    pub fn get_type(&self) -> BlockType {
+    pub const fn get_type(&self) -> BlockType {
         match &self.lstm {
             LSTMVariant::SLSTM(_) => BlockType::SLSTM,
             LSTMVariant::MLSTM(_) => BlockType::MLSTM,

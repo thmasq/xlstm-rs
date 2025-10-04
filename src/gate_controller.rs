@@ -30,7 +30,7 @@ impl<B: Backend> GateController<B> {
         }
     }
 
-    /// Compute gate output: input_transform(x) + hidden_transform(h)
+    /// Compute gate output: `input_transform(x)` + `hidden_transform(h)`
     pub fn forward(&self, input: Tensor<B, 2>, hidden: Tensor<B, 2>) -> Tensor<B, 2> {
         self.input_transform.forward(input) + self.hidden_transform.forward(hidden)
     }

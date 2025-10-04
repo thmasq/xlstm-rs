@@ -19,15 +19,15 @@ use num_traits::{FromPrimitive, ToPrimitive};
 /// State for mLSTM containing cell matrix and hidden state
 #[derive(Clone, Debug)]
 pub struct MLstmstate<B: Backend> {
-    /// Cell state - matrix of shape [batch_size, hidden_size, hidden_size]
+    /// Cell state - matrix of shape [`batch_size`, `hidden_size`, `hidden_size`]
     pub cell: Tensor<B, 3>,
-    /// Hidden state - vector of shape [batch_size, hidden_size]
+    /// Hidden state - vector of shape [`batch_size`, `hidden_size`]
     pub hidden: Tensor<B, 2>,
 }
 
 impl<B: Backend> MLstmstate<B> {
     /// Create a new mLSTM state
-    pub fn new(cell: Tensor<B, 3>, hidden: Tensor<B, 2>) -> Self {
+    pub const fn new(cell: Tensor<B, 3>, hidden: Tensor<B, 2>) -> Self {
         Self { cell, hidden }
     }
 }
@@ -91,11 +91,11 @@ impl<B: Backend> MLstm<B> {
     /// Forward pass through mLSTM
     ///
     /// # Arguments
-    /// * `input_seq` - Input tensor of shape [batch_size, seq_length, input_size]
+    /// * `input_seq` - Input tensor of shape [`batch_size`, `seq_length`, `input_size`]
     /// * `state` - Optional initial state
     ///
     /// # Returns
-    /// * Output tensor of shape [batch_size, seq_length, hidden_size]
+    /// * Output tensor of shape [`batch_size`, `seq_length`, `hidden_size`]
     /// * Final state
     pub fn forward(
         &self,
@@ -103,8 +103,7 @@ impl<B: Backend> MLstm<B> {
         state: Option<alloc::vec::Vec<MLstmstate<B>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<MLstmstate<B>>)
     where
-        <B as Backend>::FloatElem: ToPrimitive,
-        <B as Backend>::FloatElem: FromPrimitive,
+        <B as Backend>::FloatElem: ToPrimitive + FromPrimitive,
     {
         let device = input_seq.device();
         let [batch_size, seq_length, _] = input_seq.dims();
@@ -123,11 +122,8 @@ impl<B: Backend> MLstm<B> {
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let state = &hidden_states[layer_idx];
-                let (h_new, c_new) = layer.forward(
-                    layer_input.clone(),
-                    state.hidden.clone(),
-                    state.cell.clone(),
-                );
+                let (h_new, c_new) =
+                    layer.forward(&layer_input, state.hidden.clone(), state.cell.clone());
 
                 hidden_states[layer_idx] = MLstmstate::new(c_new, h_new.clone());
 
@@ -205,11 +201,11 @@ impl<B: Backend> MLstmcell<B> {
 
         // Initialize biases with specific values for stability
         let mut bias_data = alloc::vec![0.0; 3 * hidden_size];
-        for i in 0..hidden_size {
-            bias_data[i] = -3.0;
+        for item in bias_data.iter_mut().take(hidden_size) {
+            *item = -3.0;
         }
-        for i in hidden_size..(2 * hidden_size) {
-            bias_data[i] = -3.0;
+        for item in bias_data.iter_mut().take(2 * hidden_size).skip(hidden_size) {
+            *item = -3.0;
         }
         let bias = Tensor::from_floats(bias_data.as_slice(), device);
 
@@ -241,16 +237,16 @@ impl<B: Backend> MLstmcell<B> {
     /// Forward pass through mLSTM cell with matrix memory
     ///
     /// # Arguments
-    /// * `input` - Input tensor [batch_size, input_size]
-    /// * `hidden` - Hidden state [batch_size, hidden_size]
-    /// * `cell` - Cell state (matrix) [batch_size, hidden_size, hidden_size]
+    /// * `input` - Input tensor [`batch_size`, `input_size`]
+    /// * `hidden` - Hidden state [`batch_size`, `hidden_size`]
+    /// * `cell` - Cell state (matrix) [`batch_size`, `hidden_size`, `hidden_size`]
     ///
     /// # Returns
     /// * New hidden state
     /// * New cell state
     pub fn forward(
         &self,
-        input: Tensor<B, 2>,
+        input: &Tensor<B, 2>,
         hidden: Tensor<B, 2>,
         cell: Tensor<B, 3>,
     ) -> (Tensor<B, 2>, Tensor<B, 3>)
@@ -261,7 +257,7 @@ impl<B: Backend> MLstmcell<B> {
         // Compute gates: i, f, o
         let gates = input.clone().matmul(self.weight_ih.val().transpose())
             + hidden.matmul(self.weight_hh.val().transpose())
-            + self.bias.val().clone().unsqueeze_dim(0);
+            + self.bias.val().unsqueeze_dim(0);
 
         let chunks = gates.chunk(3, 1);
         let i_gate = &chunks[0];
@@ -331,7 +327,7 @@ mod tests {
 
         let input = Tensor::<TestBackend, 3>::random([4, 10, 64], Distribution::Default, &device);
 
-        let (output, states) = mlstm.forward(input, None);
+        let (output, states) = mlstm.forward(&input, None);
 
         assert_eq!(output.dims(), [4, 10, 128]);
         assert_eq!(states.len(), 2);
@@ -348,7 +344,7 @@ mod tests {
         let hidden = Tensor::<TestBackend, 2>::zeros([4, 64], &device);
         let cell_state = Tensor::<TestBackend, 3>::zeros([4, 64, 64], &device);
 
-        let (h_new, c_new) = cell.forward(input, hidden, cell_state);
+        let (h_new, c_new) = cell.forward(&input, hidden, cell_state);
 
         assert_eq!(h_new.dims(), [4, 64]);
         assert_eq!(c_new.dims(), [4, 64, 64]);

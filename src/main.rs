@@ -4,7 +4,7 @@
 Financial Time Series Forecasting with xLSTM using Embeddings
 
 This example demonstrates how to use xLSTM for financial forecasting
-using pre-computed embeddings from embeddings_128.csv.
+using pre-computed embeddings from `embeddings_128.csv`.
 
 Author: Mudit Bhargava (Ported to Rust)
 Date: October 2025
@@ -24,7 +24,18 @@ use xlstm::{LstmType, XLstmconfig};
 
 type MyBackend = Autodiff<Wgpu>;
 
-#[derive(Debug, Deserialize)]
+type DataLoadResult = Result<(Vec<Vec<f32>>, Vec<f32>), Box<dyn Error>>;
+
+type SequenceData<B> = (
+    Vec<Tensor<B, 2>>, // train_x
+    Vec<Tensor<B, 2>>, // train_y
+    Vec<Tensor<B, 2>>, // test_x
+    Vec<Tensor<B, 2>>, // test_y
+    Vec<(f32, f32)>,   // test_prices: (current_price, next_price)
+);
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
 struct EmbeddingRecord {
     trading_date: String,
     trading_code: String,
@@ -61,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device = WgpuDevice::default();
 
     // Create sequences
-    println!("Creating sequences (seq_length={})...", seq_length);
+    println!("Creating sequences (seq_length={seq_length})...");
     let (train_x, train_y, test_x, test_y, test_prices) =
         create_sequences(&embeddings, &prices, seq_length, train_split, &device);
 
@@ -89,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Starting training...\n");
 
     // Training loop
-    let num_train_batches = (train_x.len() + batch_size - 1) / batch_size;
+    let num_train_batches = train_x.len().div_ceil(batch_size);
 
     for epoch in 0..num_epochs {
         let mut total_loss = 0.0f32;
@@ -108,10 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|t| t.clone().unsqueeze_dim(0))
                 .collect();
-            let batch_y: Vec<_> = train_y[start_idx..end_idx]
-                .iter()
-                .map(|t| t.clone())
-                .collect();
+            let batch_y: Vec<_> = train_y[start_idx..end_idx].to_vec();
 
             let input_batch = Tensor::cat(batch_x, 0);
             let target_batch = Tensor::cat(batch_y, 0);
@@ -139,7 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         // Validation
         if epoch % 5 == 0 && !test_x.is_empty() {
-            let val_loss = evaluate(&model, &test_x, &test_y, &device);
+            let val_loss = evaluate(&model, &test_x, &test_y);
             println!(
                 "Epoch [{:2}/{}], Train Loss: {:.6}, Val Loss: {:.6}",
                 epoch + 1,
@@ -160,16 +168,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\nTraining completed!");
     println!("\nModel Performance:");
     println!("  - Input: 128-dim embeddings representing market state");
-    println!(
-        "  - Architecture: {} alternating sLSTM/mLSTM blocks",
-        num_blocks
-    );
-    println!("  - Sequence length: {} days", seq_length);
+    println!("  - Architecture: {num_blocks} alternating sLSTM/mLSTM blocks");
+    println!("  - Sequence length: {seq_length} days");
     println!("  - Output: Next day price prediction");
 
     // Make predictions on test set
     println!("\n\nGenerating predictions on test set...");
-    let (predictions, actuals) = make_predictions(&model, &test_x, &test_y, &test_prices, &device);
+    let (predictions, actuals) = make_predictions(&model, &test_x, &test_prices);
 
     // Calculate metrics
     let mse = predictions
@@ -187,8 +192,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         / predictions.len() as f32;
 
     println!("\nPrediction Metrics:");
-    println!("  RMSE: {:.4}", rmse);
-    println!("  MAE:  {:.4}", mae);
+    println!("  RMSE: {rmse:.4}");
+    println!("  MAE:  {mae:.4}");
 
     // Create visualizations
     println!("\nCreating visualizations...");
@@ -202,7 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn load_data(path: &str) -> Result<(Vec<Vec<f32>>, Vec<f32>), Box<dyn Error>> {
+fn load_data(path: &str) -> DataLoadResult {
     let mut reader = ReaderBuilder::new().has_headers(true).from_path(path)?;
 
     let mut embeddings = Vec::new();
@@ -214,7 +219,7 @@ fn load_data(path: &str) -> Result<(Vec<Vec<f32>>, Vec<f32>), Box<dyn Error>> {
         // Extract embeddings in order (emb_0 to emb_127)
         let mut emb_vec = Vec::with_capacity(128);
         for i in 0..128 {
-            let key = format!("emb_{}", i);
+            let key = format!("emb_{i}");
             if let Some(&value) = record.embeddings.get(&key) {
                 emb_vec.push(value);
             }
@@ -235,13 +240,7 @@ fn create_sequences<B: Backend>(
     seq_length: usize,
     train_split: f32,
     device: &B::Device,
-) -> (
-    Vec<Tensor<B, 2>>,
-    Vec<Tensor<B, 2>>,
-    Vec<Tensor<B, 2>>,
-    Vec<Tensor<B, 2>>,
-    Vec<(f32, f32)>, // (current_price, next_price) for test set
-) {
+) -> SequenceData<B> {
     let mut x_data = Vec::new();
     let mut y_data = Vec::new();
     let mut price_pairs = Vec::new();
@@ -283,7 +282,6 @@ fn evaluate<B: Backend>(
     model: &xlstm::XLstm<B>,
     test_x: &[Tensor<B, 2>],
     test_y: &[Tensor<B, 2>],
-    device: &B::Device,
 ) -> f32
 where
     <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive,
@@ -302,7 +300,7 @@ where
             .iter()
             .map(|t| t.clone().unsqueeze_dim(0))
             .collect();
-        let batch_y: Vec<_> = test_y[i..end_idx].iter().map(|t| t.clone()).collect();
+        let batch_y: Vec<_> = test_y[i..end_idx].to_vec();
 
         let input_batch = Tensor::cat(batch_x, 0);
         let target_batch = Tensor::cat(batch_y, 0);
@@ -321,9 +319,7 @@ where
 fn make_predictions<B: Backend>(
     model: &xlstm::XLstm<B>,
     test_x: &[Tensor<B, 2>],
-    test_y: &[Tensor<B, 2>],
     test_prices: &[(f32, f32)],
-    device: &B::Device,
 ) -> (Vec<f32>, Vec<f32>)
 where
     <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive,
@@ -389,7 +385,7 @@ fn plot_predictions(
             &BLUE,
         ))?
         .label("Actual")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
 
     // Plot predictions
     chart
@@ -398,16 +394,16 @@ fn plot_predictions(
             &RED,
         ))?
         .label("Predicted")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
-    println!("  Saved: {}", filename);
+    println!("  Saved: {filename}");
 
     Ok(())
 }
@@ -437,7 +433,7 @@ fn plot_scatter(
         .margin(10)
         .x_label_area_size(40)
         .y_label_area_size(60)
-        .build_cartesian_2d(range.clone(), range.clone())?;
+        .build_cartesian_2d(range.clone(), range)?;
 
     chart
         .configure_mesh()
@@ -455,7 +451,7 @@ fn plot_scatter(
             &BLACK.mix(0.3),
         ))?
         .label("Perfect Prediction")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK));
 
     // Plot scatter points
     chart
@@ -470,12 +466,12 @@ fn plot_scatter(
 
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()?;
 
     root.present()?;
-    println!("  Saved: {}", filename);
+    println!("  Saved: {filename}");
 
     Ok(())
 }
