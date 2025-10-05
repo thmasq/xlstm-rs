@@ -86,24 +86,25 @@ pub struct SLstm<B: Backend> {
 }
 
 impl<B: Backend> SLstm<B> {
-    /// Forward pass through sLSTM
+    /// Forward pass through sLSTM consuming and returning states
     ///
     /// # Arguments
     /// * `input_seq` - Input tensor of shape [`batch_size`, `seq_length`, `input_size`]
-    /// * `state` - Optional initial state
+    /// * `states` - States to consume (will be moved)
     ///
     /// # Returns
     /// * Output tensor of shape [`batch_size`, `seq_length`, `hidden_size`]
-    /// * Final state
+    /// * New states
     pub fn forward(
         &self,
         input_seq: &Tensor<B, 3>,
-        state: Option<alloc::vec::Vec<SLstmstate<B, 2>>>,
+        states: Option<alloc::vec::Vec<SLstmstate<B, 2>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<SLstmstate<B, 2>>) {
         let device = input_seq.device();
         let [batch_size, seq_length, _] = input_seq.dims();
 
-        let mut hidden_states = state.unwrap_or_else(|| self.init_hidden(batch_size, &device));
+        // Initialize or consume provided states
+        let mut hidden_states = states.unwrap_or_else(|| self.init_hidden(batch_size, &device));
 
         let mut all_outputs = alloc::vec::Vec::with_capacity(seq_length);
 
@@ -116,14 +117,20 @@ impl<B: Backend> SLstm<B> {
             let mut layer_input = input_t;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let state = &hidden_states[layer_idx];
-                let (h_new, c_new) = layer.forward(
-                    layer_input.clone(),
-                    state.hidden.clone(),
-                    state.cell.clone(),
+                // Take ownership of the state using mem::take (replaces with default/zeros)
+                let old_state = core::mem::replace(
+                    &mut hidden_states[layer_idx],
+                    SLstmstate::new(
+                        Tensor::zeros([batch_size, self.d_hidden], &device),
+                        Tensor::zeros([batch_size, self.d_hidden], &device),
+                    ),
                 );
 
-                hidden_states[layer_idx] = SLstmstate::new(c_new, h_new.clone());
+                // Consume the state and get new state back
+                let (h_new, new_state) = layer.forward(layer_input, old_state);
+
+                // Store the new state
+                hidden_states[layer_idx] = new_state;
 
                 // Apply dropout between layers (but not after last layer)
                 layer_input = if layer_idx < self.num_layers - 1 && self.dropout > 0.0 {
@@ -214,22 +221,23 @@ impl<B: Backend> SLstmcell<B> {
         }
     }
 
-    /// Forward pass through sLSTM cell with exponential gating
+    /// Forward pass through sLSTM cell consuming the state
     ///
     /// # Arguments
     /// * `input` - Input tensor [`batch_size`, `input_size`]
-    /// * `hidden` - Hidden state [`batch_size`, `hidden_size`]
-    /// * `cell` - Cell state [`batch_size`, `hidden_size`]
+    /// * `state` - State to consume (moved)
     ///
     /// # Returns
-    /// * New hidden state
-    /// * New cell state
+    /// * New hidden state (for output)
+    /// * New complete state
     pub fn forward(
         &self,
         input: Tensor<B, 2>,
-        hidden: Tensor<B, 2>,
-        cell: Tensor<B, 2>,
-    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        state: SLstmstate<B, 2>,
+    ) -> (Tensor<B, 2>, SLstmstate<B, 2>) {
+        // Destructure state to get ownership of tensors
+        let SLstmstate { cell, hidden } = state;
+
         // Compute all gates: i, f, g, o
         let gates = input.matmul(self.weight_ih.val().transpose())
             + hidden.matmul(self.weight_hh.val().transpose())
@@ -247,13 +255,15 @@ impl<B: Backend> SLstmcell<B> {
         let g = g_gate.clone().tanh();
         let o = activation::sigmoid(o_gate.clone());
 
-        // Update cell state
+        // Update cell state (consuming old cell)
         let c_new = f * cell + i * g;
 
         // Update hidden state
         let h_new = o * c_new.clone().tanh();
 
-        (h_new, c_new)
+        // Return both the hidden state (for output) and new complete state
+        let new_state = SLstmstate::new(c_new, h_new.clone());
+        (h_new, new_state)
     }
 }
 
@@ -286,12 +296,34 @@ mod tests {
         let cell = SLstmcell::new(32, 64, &Initializer::XavierNormal { gain: 1.0 }, &device);
 
         let input = Tensor::<TestBackend, 2>::random([4, 32], Distribution::Default, &device);
-        let hidden = Tensor::<TestBackend, 2>::zeros([4, 64], &device);
-        let cell_state = Tensor::<TestBackend, 2>::zeros([4, 64], &device);
+        let state = SLstmstate::new(
+            Tensor::<TestBackend, 2>::zeros([4, 64], &device),
+            Tensor::<TestBackend, 2>::zeros([4, 64], &device),
+        );
 
-        let (h_new, c_new) = cell.forward(input, hidden, cell_state);
+        let (h_new, new_state) = cell.forward(input, state);
 
         assert_eq!(h_new.dims(), [4, 64]);
-        assert_eq!(c_new.dims(), [4, 64]);
+        assert_eq!(new_state.cell.dims(), [4, 64]);
+        assert_eq!(new_state.hidden.dims(), [4, 64]);
+    }
+
+    #[test]
+    fn test_slstm_state_reuse() {
+        let device = Default::default();
+        let config = SLstmconfig::new(32, 64, 1);
+        let slstm = config.init::<TestBackend>(&device);
+
+        let input1 = Tensor::<TestBackend, 3>::random([2, 5, 32], Distribution::Default, &device);
+        let input2 = Tensor::<TestBackend, 3>::random([2, 5, 32], Distribution::Default, &device);
+
+        // First forward pass
+        let (output1, states) = slstm.forward(&input1, None);
+
+        // Second forward pass reusing states
+        let (output2, _final_states) = slstm.forward(&input2, Some(states));
+
+        assert_eq!(output1.dims(), [2, 5, 64]);
+        assert_eq!(output2.dims(), [2, 5, 64]);
     }
 }

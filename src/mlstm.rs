@@ -88,19 +88,19 @@ pub struct MLstm<B: Backend> {
 }
 
 impl<B: Backend> MLstm<B> {
-    /// Forward pass through mLSTM
+    /// Forward pass through mLSTM consuming and returning states
     ///
     /// # Arguments
     /// * `input_seq` - Input tensor of shape [`batch_size`, `seq_length`, `input_size`]
-    /// * `state` - Optional initial state
+    /// * `states` - States to consume (will be moved)
     ///
     /// # Returns
     /// * Output tensor of shape [`batch_size`, `seq_length`, `hidden_size`]
-    /// * Final state
+    /// * New states
     pub fn forward(
         &self,
         input_seq: &Tensor<B, 3>,
-        state: Option<alloc::vec::Vec<MLstmstate<B>>>,
+        states: Option<alloc::vec::Vec<MLstmstate<B>>>,
     ) -> (Tensor<B, 3>, alloc::vec::Vec<MLstmstate<B>>)
     where
         <B as Backend>::FloatElem: ToPrimitive + FromPrimitive,
@@ -108,7 +108,8 @@ impl<B: Backend> MLstm<B> {
         let device = input_seq.device();
         let [batch_size, seq_length, _] = input_seq.dims();
 
-        let mut hidden_states = state.unwrap_or_else(|| self.init_hidden(batch_size, &device));
+        // Initialize or consume provided states
+        let mut hidden_states = states.unwrap_or_else(|| self.init_hidden(batch_size, &device));
 
         let mut all_outputs = alloc::vec::Vec::with_capacity(seq_length);
 
@@ -121,11 +122,20 @@ impl<B: Backend> MLstm<B> {
             let mut layer_input = input_t;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let state = &hidden_states[layer_idx];
-                let (h_new, c_new) =
-                    layer.forward(&layer_input, state.hidden.clone(), state.cell.clone());
+                // Take ownership of the state using mem::replace
+                let old_state = core::mem::replace(
+                    &mut hidden_states[layer_idx],
+                    MLstmstate::new(
+                        Tensor::zeros([batch_size, self.d_hidden, self.d_hidden], &device),
+                        Tensor::zeros([batch_size, self.d_hidden], &device),
+                    ),
+                );
 
-                hidden_states[layer_idx] = MLstmstate::new(c_new, h_new.clone());
+                // Consume the state and get new state back
+                let (h_new, new_state) = layer.forward(&layer_input, old_state);
+
+                // Store the new state
+                hidden_states[layer_idx] = new_state;
 
                 // Apply dropout between layers (but not after last layer)
                 layer_input = if layer_idx < self.num_layers - 1 && self.dropout > 0.0 {
@@ -234,26 +244,26 @@ impl<B: Backend> MLstmcell<B> {
         }
     }
 
-    /// Forward pass through mLSTM cell with matrix memory
+    /// Forward pass through mLSTM cell consuming the state
     ///
     /// # Arguments
     /// * `input` - Input tensor [`batch_size`, `input_size`]
-    /// * `hidden` - Hidden state [`batch_size`, `hidden_size`]
-    /// * `cell` - Cell state (matrix) [`batch_size`, `hidden_size`, `hidden_size`]
+    /// * `state` - State to consume (moved)
     ///
     /// # Returns
-    /// * New hidden state
-    /// * New cell state
+    /// * New hidden state (for output)
+    /// * New complete state
     pub fn forward(
         &self,
         input: &Tensor<B, 2>,
-        hidden: Tensor<B, 2>,
-        cell: Tensor<B, 3>,
-    ) -> (Tensor<B, 2>, Tensor<B, 3>)
+        state: MLstmstate<B>,
+    ) -> (Tensor<B, 2>, MLstmstate<B>)
     where
-        // FloatElem must be convertible to/from primitive numbers
         <B as Backend>::FloatElem: num_traits::ToPrimitive + num_traits::FromPrimitive + Copy,
     {
+        // Destructure state to get ownership of tensors
+        let MLstmstate { cell, hidden } = state;
+
         // Compute gates: i, f, o
         let gates = input.clone().matmul(self.weight_ih.val().transpose())
             + hidden.matmul(self.weight_hh.val().transpose())
@@ -308,7 +318,9 @@ impl<B: Backend> MLstmcell<B> {
         let qc = q_unsqueezed.matmul(c_new.clone()).squeeze(1);
         let h_new = o * qc;
 
-        (h_new, c_new)
+        // Return both the hidden state (for output) and new complete state
+        let new_state = MLstmstate::new(c_new, h_new.clone());
+        (h_new, new_state)
     }
 }
 
@@ -341,12 +353,34 @@ mod tests {
         let cell = MLstmcell::new(32, 64, &Initializer::XavierNormal { gain: 1.0 }, &device);
 
         let input = Tensor::<TestBackend, 2>::random([4, 32], Distribution::Default, &device);
-        let hidden = Tensor::<TestBackend, 2>::zeros([4, 64], &device);
-        let cell_state = Tensor::<TestBackend, 3>::zeros([4, 64, 64], &device);
+        let state = MLstmstate::new(
+            Tensor::<TestBackend, 3>::zeros([4, 64, 64], &device),
+            Tensor::<TestBackend, 2>::zeros([4, 64], &device),
+        );
 
-        let (h_new, c_new) = cell.forward(&input, hidden, cell_state);
+        let (h_new, new_state) = cell.forward(&input, state);
 
         assert_eq!(h_new.dims(), [4, 64]);
-        assert_eq!(c_new.dims(), [4, 64, 64]);
+        assert_eq!(new_state.cell.dims(), [4, 64, 64]);
+        assert_eq!(new_state.hidden.dims(), [4, 64]);
+    }
+
+    #[test]
+    fn test_mlstm_state_reuse() {
+        let device = Default::default();
+        let config = MLstmconfig::new(32, 64, 1);
+        let mlstm = config.init::<TestBackend>(&device);
+
+        let input1 = Tensor::<TestBackend, 3>::random([2, 5, 32], Distribution::Default, &device);
+        let input2 = Tensor::<TestBackend, 3>::random([2, 5, 32], Distribution::Default, &device);
+
+        // First forward pass
+        let (output1, states) = mlstm.forward(&input1, None);
+
+        // Second forward pass reusing states
+        let (output2, _final_states) = mlstm.forward(&input2, Some(states));
+
+        assert_eq!(output1.dims(), [2, 5, 64]);
+        assert_eq!(output2.dims(), [2, 5, 64]);
     }
 }
