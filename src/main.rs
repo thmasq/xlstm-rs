@@ -12,7 +12,9 @@ Date: October 2025
 */
 
 use burn::{
+    module::Module,
     optim::{AdamConfig, GradientsParams, Optimizer},
+    record::{CompactRecorder, Recorder},
     tensor::{Tensor, backend::Backend},
 };
 use burn_autodiff::Autodiff;
@@ -22,7 +24,8 @@ use csv::ReaderBuilder;
 use plotters::prelude::*;
 use serde::Deserialize;
 use std::error::Error;
-use xlstm::{LstmType, XLstmconfig};
+use std::path::Path;
+use xlstm::{LstmType, XLstm, XLstmconfig};
 
 type MyBackend = Autodiff<Wgpu>;
 
@@ -48,6 +51,43 @@ struct EmbeddingRecord {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let mode = if args.len() > 1 { &args[1] } else { "train" };
+
+    match mode {
+        "train" => train_model(),
+        "infer" => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} infer <model_path>", args[0]);
+                std::process::exit(1);
+            }
+            infer_model(&args[2])
+        }
+        "continue" => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} continue <model_path>", args[0]);
+                std::process::exit(1);
+            }
+            continue_training(&args[2])
+        }
+        _ => {
+            eprintln!("Usage:");
+            eprintln!("  {} train              - Train a new model", args[0]);
+            eprintln!(
+                "  {} infer <model_path> - Run inference with saved model",
+                args[0]
+            );
+            eprintln!(
+                "  {} continue <model_path> - Continue training from saved model",
+                args[0]
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn train_model() -> Result<(), Box<dyn Error>> {
     println!("xLSTM Financial Forecasting with Embeddings");
     println!("==========================================\n");
 
@@ -57,14 +97,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Loaded {} records", prices.len());
 
     // Hyperparameters
-    let input_size = 128; // Embedding dimensions
+    let input_size = 128;
     let hidden_size = 128;
     let num_layers = 2;
     let num_blocks = 4;
-    let output_size = 1; // Predict next price
+    let output_size = 1;
     let dropout = 0.2;
 
-    let seq_length = 20; // Use 20 days to predict next day
+    let seq_length = 20;
     let batch_size = 8;
     let num_epochs = 20;
     let learning_rate = 0.0001;
@@ -73,7 +113,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Device
     let device = WgpuDevice::default();
 
-    // Create sequences (now returns stacked tensors)
+    // Create sequences
     println!("Creating sequences (seq_length={seq_length})...");
     let (train_x, train_y, test_x, test_y, test_prices) =
         create_sequences(&embeddings, &prices, seq_length, train_split, &device);
@@ -84,7 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Training samples: {}", num_train);
     println!("Testing samples: {}\n", num_test);
 
-    // Create model with alternating blocks
+    // Create model
     println!("Creating xLSTM model with alternating sLSTM/mLSTM blocks...");
     let config = XLstmconfig::new(input_size, hidden_size, num_layers, num_blocks, output_size)
         .with_dropout(dropout)
@@ -104,7 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Starting training...\n");
 
-    // Training loop with vectorized batching
+    // Training loop
     let num_train_batches = num_train.div_ceil(batch_size);
 
     for epoch in 0..num_epochs {
@@ -119,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 break;
             }
 
-            // Vectorized batch extraction using slicing (no clones!)
+            // Vectorized batch extraction using slicing
             let input_batch =
                 train_x
                     .clone()
@@ -175,17 +215,242 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("\nTraining completed!");
-    println!("\nModel Performance:");
-    println!("  - Input: 128-dim embeddings representing market state");
-    println!("  - Architecture: {num_blocks} alternating sLSTM/mLSTM blocks");
-    println!("  - Sequence length: {seq_length} days");
-    println!("  - Output: Next day price prediction");
 
-    // Make predictions on test set
-    println!("\n\nGenerating predictions on test set...");
+    // Save the model
+    let model_path = "xlstm_model";
+    save_model(&model, model_path)?;
+    println!("\nModel saved to: {}.mpk", model_path);
+
+    // Make predictions
+    println!("\nGenerating predictions on test set...");
     let (predictions, actuals) =
         make_predictions(&model, &test_x, &test_prices, seq_length, input_size);
 
+    display_metrics(&predictions, &actuals)?;
+
+    Ok(())
+}
+
+fn infer_model(model_path: &str) -> Result<(), Box<dyn Error>> {
+    println!("xLSTM Inference Mode");
+    println!("===================\n");
+
+    // Load data
+    println!("Loading embeddings_128.csv...");
+    let (embeddings, prices) = load_data("embeddings_128.csv")?;
+    println!("Loaded {} records", prices.len());
+
+    // Hyperparameters (must match training)
+    let input_size = 128;
+    let hidden_size = 128;
+    let num_layers = 2;
+    let num_blocks = 4;
+    let output_size = 1;
+    let dropout = 0.2;
+
+    let seq_length = 20;
+    let train_split = 0.8;
+
+    // Device
+    let device = WgpuDevice::default();
+
+    // Create sequences
+    println!("Creating sequences...");
+    let (_, _, test_x, _, test_prices) =
+        create_sequences(&embeddings, &prices, seq_length, train_split, &device);
+
+    println!("Testing samples: {}\n", test_x.dims()[0]);
+
+    // Load model
+    println!("Loading model from: {}", model_path);
+    let config = XLstmconfig::new(input_size, hidden_size, num_layers, num_blocks, output_size)
+        .with_dropout(dropout)
+        .with_lstm_type(LstmType::Alternate)
+        .with_use_projection(true);
+
+    let model = load_model::<MyBackend>(config, model_path, &device)?;
+    println!("Model loaded successfully!\n");
+
+    // Make predictions
+    println!("Generating predictions...");
+    let (predictions, actuals) =
+        make_predictions(&model, &test_x, &test_prices, seq_length, input_size);
+
+    display_metrics(&predictions, &actuals)?;
+
+    Ok(())
+}
+
+fn continue_training(model_path: &str) -> Result<(), Box<dyn Error>> {
+    println!("xLSTM Continue Training Mode");
+    println!("===========================\n");
+
+    // Load data
+    println!("Loading embeddings_128.csv...");
+    let (embeddings, prices) = load_data("embeddings_128.csv")?;
+    println!("Loaded {} records", prices.len());
+
+    // Hyperparameters
+    let input_size = 128;
+    let hidden_size = 128;
+    let num_layers = 2;
+    let num_blocks = 4;
+    let output_size = 1;
+    let dropout = 0.2;
+
+    let seq_length = 20;
+    let batch_size = 8;
+    let num_epochs = 10; // Additional epochs
+    let learning_rate = 0.00005; // Lower learning rate for fine-tuning
+    let train_split = 0.8;
+
+    // Device
+    let device = WgpuDevice::default();
+
+    // Create sequences
+    println!("Creating sequences...");
+    let (train_x, train_y, test_x, test_y, test_prices) =
+        create_sequences(&embeddings, &prices, seq_length, train_split, &device);
+
+    let num_train = train_x.dims()[0];
+    let num_test = test_x.dims()[0];
+
+    println!("Training samples: {}", num_train);
+    println!("Testing samples: {}\n", num_test);
+
+    // Load model
+    println!("Loading model from: {}", model_path);
+    let config = XLstmconfig::new(input_size, hidden_size, num_layers, num_blocks, output_size)
+        .with_dropout(dropout)
+        .with_lstm_type(LstmType::Alternate)
+        .with_use_projection(true);
+
+    let mut model = load_model::<MyBackend>(config, model_path, &device)?;
+    println!("Model loaded successfully!\n");
+
+    // Create optimizer
+    let mut optim = AdamConfig::new()
+        .with_beta_1(0.9)
+        .with_beta_2(0.999)
+        .with_epsilon(1e-8)
+        .init();
+
+    println!("Continuing training for {} more epochs...\n", num_epochs);
+
+    // Training loop
+    let num_train_batches = num_train.div_ceil(batch_size);
+
+    for epoch in 0..num_epochs {
+        let mut total_loss = 0.0f32;
+        let mut num_batches = 0;
+
+        for batch_idx in 0..num_train_batches {
+            let start_idx = batch_idx * batch_size;
+            let end_idx = (start_idx + batch_size).min(num_train);
+
+            if start_idx >= end_idx {
+                break;
+            }
+
+            let input_batch =
+                train_x
+                    .clone()
+                    .slice([start_idx..end_idx, 0..seq_length, 0..input_size]);
+            let target_batch = train_y.clone().slice([start_idx..end_idx, 0..output_size]);
+
+            let (predictions, _) = model.predict_last(input_batch, None);
+            let loss = ((predictions - target_batch).powf_scalar(2.0)).mean();
+
+            let loss_value: <MyBackend as Backend>::FloatElem = loss.clone().into_scalar();
+            let loss_f32 = num_traits::ToPrimitive::to_f32(&loss_value).unwrap_or(0.0);
+
+            let grads = loss.backward();
+            let grads = GradientsParams::from_grads(grads, &model);
+            model = optim.step(learning_rate, model, grads);
+
+            total_loss += loss_f32;
+            num_batches += 1;
+        }
+
+        let avg_loss = total_loss / num_batches as f32;
+
+        if epoch % 2 == 0 && num_test > 0 {
+            let val_loss = evaluate(
+                &model,
+                &test_x,
+                &test_y,
+                seq_length,
+                input_size,
+                output_size,
+            );
+            println!(
+                "Epoch [{:2}/{}], Train Loss: {:.6}, Val Loss: {:.6}",
+                epoch + 1,
+                num_epochs,
+                avg_loss,
+                val_loss
+            );
+        } else {
+            println!(
+                "Epoch [{:2}/{}], Train Loss: {:.6}",
+                epoch + 1,
+                num_epochs,
+                avg_loss
+            );
+        }
+    }
+
+    // Save updated model
+    let updated_model_path = format!("{}_continued", model_path);
+    save_model(&model, &updated_model_path)?;
+    println!("\nUpdated model saved to: {}.mpk", updated_model_path);
+
+    // Make predictions
+    println!("\nGenerating predictions...");
+    let (predictions, actuals) =
+        make_predictions(&model, &test_x, &test_prices, seq_length, input_size);
+
+    display_metrics(&predictions, &actuals)?;
+
+    Ok(())
+}
+
+/// Save model to disk
+fn save_model<B: Backend>(model: &XLstm<B>, path: &str) -> Result<(), Box<dyn Error>> {
+    let recorder = CompactRecorder::new();
+    model
+        .clone()
+        .save_file(path, &recorder)
+        .map_err(|e| format!("Failed to save model: {}", e))?;
+    Ok(())
+}
+
+/// Load model from disk
+fn load_model<B: Backend>(
+    config: XLstmconfig,
+    path: &str,
+    device: &B::Device,
+) -> Result<XLstm<B>, Box<dyn Error>> {
+    let recorder = CompactRecorder::new();
+
+    // Check if file exists
+    let model_file = if Path::new(path).exists() {
+        path.to_string()
+    } else if Path::new(&format!("{}.mpk", path)).exists() {
+        format!("{}.mpk", path)
+    } else {
+        return Err(format!("Model file not found: {}", path).into());
+    };
+
+    let record = recorder
+        .load(model_file.into(), device)
+        .map_err(|e| format!("Failed to load model: {}", e))?;
+
+    let model = config.init::<B>(device).load_record(record);
+    Ok(model)
+}
+
+fn display_metrics(predictions: &[f32], actuals: &[f32]) -> Result<(), Box<dyn Error>> {
     // Calculate metrics
     let mse = predictions
         .iter()
@@ -207,8 +472,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Create visualizations
     println!("\nCreating visualizations...");
-    plot_predictions(&predictions, &actuals, "predictions_vs_actual.png")?;
-    plot_scatter(&predictions, &actuals, "prediction_scatter.png")?;
+    plot_predictions(predictions, actuals, "predictions_vs_actual.png")?;
+    plot_scatter(predictions, actuals, "prediction_scatter.png")?;
 
     println!("\nVisualizations saved:");
     println!("  - predictions_vs_actual.png: Time series comparison");
@@ -269,7 +534,7 @@ fn create_sequences<B: Backend>(
         // Target: next price (normalized as relative change)
         let current_price = prices[i + seq_length - 1];
         let next_price = prices[i + seq_length];
-        let target = (next_price - current_price) / current_price; // Relative change
+        let target = (next_price - current_price) / current_price;
 
         y_data.push(target);
         price_pairs.push((current_price, next_price));
