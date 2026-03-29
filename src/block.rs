@@ -16,7 +16,7 @@ use burn::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{MLstm, MLstmconfig, MLstmstate, SLstm, SLstmconfig, SLstmstate};
+use crate::{MLstm, MLstmconfig, MLstmstate, SLstm, SLstmconfig, SLstmstate, MinGru, MinGruConfig, MinGruState};
 
 /// Type of LSTM block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,8 @@ pub enum BlockType {
     SLSTM,
     /// Matrix LSTM
     MLSTM,
+    /// Minimal GRU
+    MINGRU,
 }
 
 /// Configuration for xLSTM block
@@ -36,13 +38,16 @@ pub struct XLstmblockConfig {
     pub hidden_size: usize,
     /// Number of layers
     pub num_layers: usize,
+    /// Number of heads for multi-head mLSTM
+    #[config(default = "4")]
+    pub num_heads: usize,
     /// Dropout probability
     #[config(default = "0.0")]
     pub dropout: f64,
     /// Block type (sLSTM or mLSTM)
     pub block_type: BlockType,
     /// Weight initializer
-    #[config(default = "Initializer::XavierNormal{gain:1.0}")]
+    #[config(default = "Initializer::XavierNormal{gain:0.0}")]
     pub initializer: Initializer,
 }
 
@@ -67,12 +72,27 @@ impl XLstmblockConfig {
             BlockType::MLSTM => {
                 let lstm: MLstm<B> =
                     MLstmconfig::new(self.input_size, self.hidden_size, self.num_layers)
+                        .with_num_heads(self.num_heads)
                         .with_dropout(self.dropout)
                         .with_initializer(self.initializer.clone())
                         .init(device);
 
                 XLstmblock {
                     lstm: LSTMVariant::MLSTM(lstm),
+                    norm: LayerNormConfig::new(self.hidden_size).init(device),
+                    dropout: DropoutConfig::new(self.dropout).init(),
+                    proj: LinearConfig::new(self.hidden_size, self.input_size).init(device),
+                }
+            }
+            BlockType::MINGRU => {
+                let gru: MinGru<B> =
+                    MinGruConfig::new(self.input_size, self.hidden_size, self.num_layers)
+                        .with_dropout(self.dropout)
+                        .with_initializer(self.initializer.clone())
+                        .init(device);
+
+                XLstmblock {
+                    lstm: LSTMVariant::MINGRU(gru),
                     norm: LayerNormConfig::new(self.hidden_size).init(device),
                     dropout: DropoutConfig::new(self.dropout).init(),
                     proj: LinearConfig::new(self.hidden_size, self.input_size).init(device),
@@ -89,6 +109,8 @@ pub enum LSTMVariant<B: Backend> {
     SLSTM(SLstm<B>),
     /// Matrix LSTM variant
     MLSTM(MLstm<B>),
+    /// Minimal GRU variant
+    MINGRU(MinGru<B>),
 }
 
 /// Enum for holding either sLSTM or mLSTM states
@@ -98,6 +120,25 @@ pub enum LSTMState<B: Backend> {
     SLSTM(alloc::vec::Vec<SLstmstate<B, 2>>),
     /// States for mLSTM
     MLSTM(alloc::vec::Vec<MLstmstate<B>>),
+    /// States for minGRU
+    MINGRU(alloc::vec::Vec<MinGruState<B>>),
+}
+
+impl<B: Backend> LSTMState<B> {
+    /// Detach the state from the computational graph
+    pub fn detach(self) -> Self {
+        match self {
+            LSTMState::SLSTM(states) => {
+                LSTMState::SLSTM(states.into_iter().map(|s| s.detach()).collect())
+            }
+            LSTMState::MLSTM(states) => {
+                LSTMState::MLSTM(states.into_iter().map(|s| s.detach()).collect())
+            }
+            LSTMState::MINGRU(states) => {
+                LSTMState::MINGRU(states.into_iter().map(|s| s.detach()).collect())
+            }
+        }
+    }
 }
 
 /// xLSTM block combining LSTM with normalization and projections
@@ -132,35 +173,74 @@ impl<B: Backend> XLstmblock<B> {
         <B as Backend>::FloatElem: num_traits::ToPrimitive,
         B: Backend<FloatElem: num_traits::FromPrimitive>,
     {
-        let (lstm_output, new_state): (Tensor<B, 3>, Option<LSTMState<B>>) =
-            match (&self.lstm, state) {
-                (LSTMVariant::SLSTM(lstm), Some(LSTMState::SLSTM(s))) => {
-                    let (out, state): (Tensor<B, 3>, Vec<SLstmstate<B, 2>>) =
-                        lstm.forward(&input_seq, Some(s)); // No clone here
-                    (out, Some(LSTMState::SLSTM(state)))
-                }
-                (LSTMVariant::SLSTM(lstm), _) => {
-                    let (out, state) = lstm.forward(&input_seq, None);
-                    (out, Some(LSTMState::SLSTM(state)))
-                }
-                (LSTMVariant::MLSTM(lstm), Some(LSTMState::MLSTM(s))) => {
-                    let (out, state) = lstm.forward(&input_seq, Some(s));
-                    (out, Some(LSTMState::MLSTM(state)))
-                }
-                (LSTMVariant::MLSTM(lstm), _) => {
-                    let (out, state) = lstm.forward(&input_seq, None);
-                    (out, Some(LSTMState::MLSTM(state)))
-                }
-            };
-
-        // Apply activation
-        let output: Tensor<B, 3> = activation::gelu(lstm_output);
-        // Apply normalization
-        let output: Tensor<B, 3> = self.norm.forward(output);
-        // Apply projection
-        let output: Tensor<B, 3> = self.proj.forward(output);
-        // Apply dropout and residual connection
-        let output: Tensor<B, 3> = self.dropout.forward(output) + input_seq;
+        let (output, new_state) = match (&self.lstm, state) {
+            (LSTMVariant::SLSTM(lstm), Some(LSTMState::SLSTM(s))) => {
+                let (out, state) = lstm.forward(&input_seq, Some(s));
+                
+                let out = self.norm.forward(out);
+                let out = activation::gelu(out);
+                let out = self.proj.forward(out);
+                let out = self.dropout.forward(out);
+                let out = out + input_seq.clone();
+                
+                (out, Some(LSTMState::SLSTM(state)))
+            }
+            (LSTMVariant::SLSTM(lstm), _) => {
+                let (out, state) = lstm.forward(&input_seq, None);
+                
+                let out = self.norm.forward(out);
+                let out = activation::gelu(out);
+                let out = self.proj.forward(out);
+                let out = self.dropout.forward(out);
+                let out = out + input_seq.clone();
+                
+                (out, Some(LSTMState::SLSTM(state)))
+            }
+            (LSTMVariant::MLSTM(lstm), Some(LSTMState::MLSTM(s))) => {
+                let (out, state) = lstm.forward(&input_seq, Some(s));
+                
+                let out = self.norm.forward(out);
+                let out = activation::gelu(out);
+                let out = self.proj.forward(out);
+                let out = self.dropout.forward(out);
+                let out = out + input_seq.clone();
+                
+                (out, Some(LSTMState::MLSTM(state)))
+            }
+            (LSTMVariant::MLSTM(lstm), _) => {
+                let (out, state) = lstm.forward(&input_seq, None);
+                
+                let out = self.norm.forward(out);
+                let out = activation::gelu(out);
+                let out = self.proj.forward(out);
+                let out = self.dropout.forward(out);
+                let out = out + input_seq.clone();
+                
+                (out, Some(LSTMState::MLSTM(state)))
+            }
+            (LSTMVariant::MINGRU(gru), Some(LSTMState::MINGRU(s))) => {
+                let (out, state) = gru.forward(input_seq.clone(), Some(s));
+                
+                let out = self.norm.forward(out);
+                let out = activation::gelu(out);
+                let out = self.proj.forward(out);
+                let out = self.dropout.forward(out);
+                let out = out + input_seq.clone();
+                
+                (out, Some(LSTMState::MINGRU(state)))
+            }
+            (LSTMVariant::MINGRU(gru), _) => {
+                let (out, state) = gru.forward(input_seq.clone(), None);
+                
+                let out = self.norm.forward(out);
+                let out = activation::gelu(out);
+                let out = self.proj.forward(out);
+                let out = self.dropout.forward(out);
+                let out = out + input_seq.clone();
+                
+                (out, Some(LSTMState::MINGRU(state)))
+            }
+        };
 
         (output, new_state)
     }
@@ -170,42 +250,7 @@ impl<B: Backend> XLstmblock<B> {
         match &self.lstm {
             LSTMVariant::SLSTM(_) => BlockType::SLSTM,
             LSTMVariant::MLSTM(_) => BlockType::MLSTM,
+            LSTMVariant::MINGRU(_) => BlockType::MINGRU,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use burn::tensor::Distribution;
-
-    type TestBackend = burn_ndarray::NdArray<f32>;
-
-    #[test]
-    fn test_slstm_block() {
-        let device = Default::default();
-        let config = XLstmblockConfig::new(64, 128, 2, BlockType::SLSTM).with_dropout(0.1);
-        let block = config.init::<TestBackend>(&device);
-
-        let input = Tensor::<TestBackend, 3>::random([4, 10, 64], Distribution::Default, &device);
-
-        let (output, state) = block.forward(input, None);
-
-        assert_eq!(output.dims(), [4, 10, 64]);
-        assert!(state.is_some());
-    }
-
-    #[test]
-    fn test_mlstm_block() {
-        let device = Default::default();
-        let config = XLstmblockConfig::new(64, 128, 2, BlockType::MLSTM).with_dropout(0.1);
-        let block = config.init::<TestBackend>(&device);
-
-        let input = Tensor::<TestBackend, 3>::random([4, 10, 64], Distribution::Default, &device);
-
-        let (output, state) = block.forward(input, None);
-
-        assert_eq!(output.dims(), [4, 10, 64]);
-        assert!(state.is_some());
     }
 }

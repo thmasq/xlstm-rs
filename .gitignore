@@ -1,1 +1,8 @@
 /target
+*.exe
+/model
+/data
+*.mpk
+/d
+*.lock
+*.mpk

@@ -31,6 +31,8 @@ pub enum LstmType {
     SLSTM,
     /// All blocks use mLSTM
     MLSTM,
+    /// All blocks use minGRU
+    MINGRU,
     /// Alternating pattern: sLSTM, mLSTM, sLSTM, mLSTM, ...
     Alternate,
     /// Custom pattern specified by user
@@ -46,6 +48,7 @@ pub enum LearningRateConfig {
     PerBlockType {
         slstm_lr: f64,
         mlstm_lr: f64,
+        mingru_lr: f64,
         other_lr: f64, // For input projection and output head
     },
     /// Explicit learning rate per block (length must match num_blocks)
@@ -63,10 +66,11 @@ impl LearningRateConfig {
     }
 
     /// Create per-block-type learning rate configuration
-    pub fn per_block_type(slstm_lr: f64, mlstm_lr: f64, other_lr: f64) -> Self {
+    pub fn per_block_type(slstm_lr: f64, mlstm_lr: f64, mingru_lr: f64, other_lr: f64) -> Self {
         Self::PerBlockType {
             slstm_lr,
             mlstm_lr,
+            mingru_lr,
             other_lr,
         }
     }
@@ -99,6 +103,9 @@ pub struct XLstmconfig {
     /// Whether to use bidirectional LSTM
     #[config(default = "false")]
     pub bidirectional: bool,
+    /// Number of heads for mLSTM blocks
+    #[config(default = "4")]
+    pub num_heads: usize,
     /// LSTM type configuration
     #[config(default = "LstmType::SLSTM")]
     pub lstm_type: LstmType,
@@ -136,6 +143,7 @@ impl XLstmconfig {
                     self.num_layers,
                     block_type,
                 )
+                .with_num_heads(self.num_heads)
                 .with_dropout(self.dropout)
                 .with_initializer(self.initializer.clone())
                 .init(device)
@@ -158,6 +166,7 @@ impl XLstmconfig {
             output_size: self.output_size,
             num_blocks: self.num_blocks,
             num_layers: self.num_layers,
+            num_heads: self.num_heads,
             dropout: self.dropout,
             use_projection: self.use_projection,
         }
@@ -167,6 +176,7 @@ impl XLstmconfig {
         match &self.lstm_type {
             LstmType::SLSTM => alloc::vec![BlockType::SLSTM; self.num_blocks],
             LstmType::MLSTM => alloc::vec![BlockType::MLSTM; self.num_blocks],
+            LstmType::MINGRU => alloc::vec![BlockType::MINGRU; self.num_blocks],
             LstmType::Alternate => (0..self.num_blocks)
                 .map(|i| {
                     if i % 2 == 0 {
@@ -209,6 +219,8 @@ pub struct XLstm<B: Backend> {
     pub num_blocks: usize,
     /// Number of layers per block
     pub num_layers: usize,
+    /// Number of heads (for mLSTM blocks)
+    pub num_heads: usize,
     /// Dropout probability
     pub dropout: f64,
     /// Whether input projection is used
@@ -237,7 +249,7 @@ impl<B: Backend> XLstm<B> {
         let mut x = if let Some((linear, norm, dropout)) = &self.input_projection {
             let mut x = linear.forward(input_seq);
             x = norm.forward(x);
-            x = activation::gelu(x);
+            // No GELU here
             dropout.forward(x)
         } else {
             input_seq
@@ -256,8 +268,8 @@ impl<B: Backend> XLstm<B> {
 
         // Apply output head
         let (linear1, dropout, linear2) = &self.output_head;
-        x = linear1.forward(x);
-        x = activation::gelu(x);
+        let mut x = linear1.forward(x);
+        x = activation::gelu(x); // <--- ESTO FALTABA. MLP Real.
         x = dropout.forward(x);
         let output = linear2.forward(x);
 
@@ -309,6 +321,7 @@ impl<B: Backend> XLstm<B> {
         println!("  Output size: {}", self.output_size);
         println!("  Layers per block: {}", self.num_layers);
         println!("  Number of blocks: {}", self.num_blocks);
+        println!("  Heads (mLSTM): {}", self.num_heads);
         println!("  Dropout: {}", self.dropout);
         println!("  Use input projection: {}", self.use_projection);
         println!("\nBlock Configuration:");
@@ -316,6 +329,7 @@ impl<B: Backend> XLstm<B> {
             let type_str = match block.get_type() {
                 BlockType::SLSTM => "sLSTM",
                 BlockType::MLSTM => "mLSTM",
+                BlockType::MINGRU => "minGRU",
             };
             println!("    Block {}: {}", i + 1, type_str);
         }
@@ -352,15 +366,12 @@ impl<B: AutodiffBackend> XLstm<B> {
         ids
     }
 
+    /// Get all parameter IDs for the model
+    pub fn get_all_param_ids(&self) -> alloc::vec::Vec<ParamId> {
+        burn::module::list_param_ids(self)
+    }
+
     /// Apply optimizer step with per-block learning rates
-    ///
-    /// # Arguments
-    /// * `lr_config` - Learning rate configuration
-    /// * `optimizer` - The optimizer to use
-    /// * `grads` - Gradients for all parameters
-    ///
-    /// # Returns
-    /// * Updated model
     pub fn optimizer_step<O: Optimizer<Self, B>>(
         self,
         lr_config: &LearningRateConfig,
@@ -371,11 +382,13 @@ impl<B: AutodiffBackend> XLstm<B> {
             LearningRateConfig::Uniform(lr) => {
                 // Simple case: single learning rate for everything
                 let grads_params = GradientsParams::from_grads(grads, &self);
+
                 optimizer.step(*lr, self, grads_params)
             }
             LearningRateConfig::PerBlockType {
                 slstm_lr,
                 mlstm_lr,
+                mingru_lr,
                 other_lr,
             } => {
                 // Collect block types before we start moving model
@@ -387,6 +400,7 @@ impl<B: AutodiffBackend> XLstm<B> {
                         let lr = match block.get_type() {
                             BlockType::SLSTM => *slstm_lr,
                             BlockType::MLSTM => *mlstm_lr,
+                            BlockType::MINGRU => *mingru_lr,
                         };
                         (i, block.get_type(), lr)
                     })
@@ -453,6 +467,7 @@ mod tests {
     fn test_xlstm_forward() {
         let device = Default::default();
         let config = XLstmconfig::new(64, 128, 2, 4, 32)
+            .with_num_heads(4)
             .with_dropout(0.1)
             .with_lstm_type(LstmType::Alternate);
 
